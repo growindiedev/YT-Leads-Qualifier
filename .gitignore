@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Secrets
+.env
+*.json
+!youtube_qualifier/requirements.txt
+
+# Temp files
+.tmp/
+/tmp/
+leads-service-account.json
