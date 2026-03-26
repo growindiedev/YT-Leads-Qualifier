@@ -16,7 +16,6 @@ from googleapiclient.errors import HttpError
 import anthropic
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -366,8 +365,8 @@ def _run_stage_1(videos: list, channel_info: dict) -> dict | None:
 def _run_stage_2(videos: list, channel_info: dict, person_name: str, company_name: str) -> dict:
     most_recent = videos[0]["published_at"]
 
-    prompt = f"""You are evaluating a YouTube channel for a content agency.
-Determine if this channel is a strong content creator (FAIL) or weak/poor quality (PASS as Condition D).
+    prompt = f"""You are evaluating a YouTube channel for a B2B content agency.
+Classify this channel into one of: D, F, or FAIL.
 
 CHANNEL DATA:
 Person: {person_name}
@@ -378,27 +377,32 @@ LAST 5 VIDEOS:
 
 RESPOND WITH ONLY A JSON OBJECT:
 {{
-  "condition": "D" or "FAIL",
+  "condition": "D" or "F" or "FAIL",
   "reasoning": "one sentence explanation"
 }}
 
-CONDITION D (PASS) — channel qualifies as weak if:
-- Videos are exclusively raw podcast recordings, webinar recordings, or interview clips
-- No visible editing, motion graphics, or production value
-- Titles suggest episode format (Ep., #123, "with [guest]", "interview")
+CONDITION D (PASS) — exclusively raw, unedited podcast/webinar/interview content:
+- Titles suggest episode format (Ep., #123, "with [guest]", "interview", "webinar")
+- No editing, motion graphics, or production value
 - No direct-to-camera scripted content from the founder
 
-FAIL — channel qualifies as strong if:
-- Direct-to-camera scripted content from the founder
-- Evidence of editing (titles/thumbnails suggest produced content)
-- Educational or authority-building content (not just podcast clips)
-- Custom branded thumbnails with text overlays
+CONDITION F (PASS) — channel posts regularly but content is unrelated to their business/offer:
+- Personal vlogs, hobby content, or lifestyle videos with no connection to their professional offer
+- Motivational or generic content not tied to their industry or service
+- No videos that would attract their target B2B audience
+- They have a channel but it does nothing to sell or support their business
 
-If genuinely unclear, default to PASS (Condition D)."""
+FAIL — channel already has strong business-relevant content:
+- Direct-to-camera scripted content from the founder about their industry/offer
+- Educational or authority-building content relevant to their business
+- Produced and edited — custom thumbnails, branded graphics
+- SEO-optimised titles targeting their B2B audience
+
+If genuinely unclear between D and F, default to D."""
 
     try:
         response = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-6",
             max_tokens=100,
             messages=[{"role": "user", "content": prompt}]
         )

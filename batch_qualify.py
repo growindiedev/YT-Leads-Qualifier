@@ -27,7 +27,6 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
 # Allow running from any directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -129,6 +128,9 @@ def _get_already_qualified(sheet_id: str) -> set:
     Dedup key priority:
       1. Personal LinkedIn URL (normalised, most reliable)
       2. (full_name.lower(), company.lower()) tuple as fallback
+
+    Uses a single batchGet call (all tabs at once) to minimise API round-trips.
+    Range capped at A1:P to avoid fetching unused columns.
     """
     session = _get_session()
 
@@ -139,39 +141,40 @@ def _get_already_qualified(sheet_id: str) -> set:
         return set()
 
     tabs = [s["properties"]["title"] for s in resp.json().get("sheets", [])]
+    if not tabs:
+        return set()
+
+    # Fetch all tabs in a single batchGet request, narrow range to first 16 columns
+    from urllib.parse import urlencode
+    params = urlencode([("ranges", f"'{t}'!A1:P") for t in tabs], doseq=True)
+    batch_resp = session.get(f"{SHEETS_BASE}/{sheet_id}/values:batchGet?{params}")
+    if not batch_resp.ok:
+        print(f"  Warning: batchGet failed ({batch_resp.status_code}). Dedup skipped.", file=sys.stderr)
+        return set()
+
     already_done = set()
+    for value_range in batch_resp.json().get("valueRanges", []):
+        rows = value_range.get("values", [])
+        if len(rows) < 2:
+            continue
+        header = rows[0]
+        if "Full Name" not in header:
+            continue
+        fn_idx = header.index("Full Name")
+        co_idx = header.index("Company") if "Company" in header else None
+        li_idx = header.index("Personal LinkedIn URL") if "Personal LinkedIn URL" in header else None
 
-    for tab in tabs:
-        try:
-            tab_resp = session.get(
-                f"{SHEETS_BASE}/{sheet_id}/values/{tab}!A1:ZZ"
-            )
-            if not tab_resp.ok:
-                continue
-            rows = tab_resp.json().get("values", [])
-            if len(rows) < 2:
-                continue
-            header = rows[0]
-            # Only parse tabs that look like our output (have "Full Name" column)
-            if "Full Name" not in header:
-                continue
-            fn_idx  = header.index("Full Name")
-            co_idx  = header.index("Company") if "Company" in header else None
-            li_idx  = header.index("Personal LinkedIn URL") if "Personal LinkedIn URL" in header else None
+        for row in rows[1:]:
+            def cell(i):
+                return row[i].strip() if i is not None and i < len(row) else ""
 
-            for row in rows[1:]:
-                def cell(i):
-                    return row[i].strip() if i is not None and i < len(row) else ""
-
-                linkedin = cell(li_idx).lower().rstrip("/")
-                if linkedin:
-                    already_done.add(linkedin)
-                name    = cell(fn_idx).lower()
-                company = cell(co_idx).lower() if co_idx is not None else ""
-                if name:
-                    already_done.add((name, company))
-        except Exception as e:
-            print(f"  Warning: could not read tab '{tab}': {e}", file=sys.stderr)
+            linkedin = cell(li_idx).lower().rstrip("/")
+            if linkedin:
+                already_done.add(linkedin)
+            name = cell(fn_idx).lower()
+            company = cell(co_idx).lower() if co_idx is not None else ""
+            if name:
+                already_done.add((name, company))
 
     return already_done
 
@@ -255,7 +258,7 @@ def _normalize_row(row: dict) -> dict:
 # Core batch processor
 # ---------------------------------------------------------------------------
 
-def process_leads(rows: list, no_claude: bool, already_done: set = None) -> list:
+def process_leads(rows: list, no_claude: bool, already_done: set = None, limit: int = None) -> list:
     """
     Run YouTube qualification for every row.
     Returns a list of result dicts (one per input row).
@@ -275,6 +278,10 @@ def process_leads(rows: list, no_claude: bool, already_done: set = None) -> list
             print(f"[{i}/{total}] SKIP (already qualified) — {person} / {company}", file=sys.stderr)
             skipped += 1
             continue
+
+        if limit and len(results) >= limit:
+            print(f"Limit of {limit} new leads reached.", file=sys.stderr)
+            break
 
         if not person or not company:
             msg = (
@@ -362,10 +369,21 @@ def write_to_sheet(results: list, sheet_id: str, tab_name: str = None) -> str:
     if not resp.ok and "already exists" not in resp.text:
         resp.raise_for_status()
 
+    CONDITION_LABELS = {
+        "A": "A (no presence)",
+        "B": "B (abandoned)",
+        "C": "C (inconsistent)",
+        "D": "D (raw podcast only)",
+        "E": "E (shorts only)",
+        "F": "F (off-topic content)",
+        "FAIL": "FAIL",
+    }
+
     # Build value rows
     rows = [OUTPUT_HEADERS]
     for r in results:
-        yt_status = r.get("yt_condition", "")
+        raw_condition = r.get("yt_condition", "")
+        yt_status = CONDITION_LABELS.get(raw_condition, raw_condition)
         rows.append(
             [
                 r.get("full_name", ""),
@@ -437,6 +455,12 @@ def main():
         "--tab-name",
         help="Name for the new sheet tab (default: 'YT Results YYYY-MM-DD HH:MM')",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        metavar="N",
+        help="Only process the first N leads (after dedup skips)",
+    )
 
     args = parser.parse_args()
     sheet_id = _extract_sheet_id(args.output_sheet)
@@ -472,7 +496,7 @@ def main():
     if already_done:
         print(f"Found {len(already_done)} existing entries in output sheet.", file=sys.stderr)
 
-    results = process_leads(rows, no_claude=args.no_claude, already_done=already_done)
+    results = process_leads(rows, no_claude=args.no_claude, already_done=already_done, limit=args.limit)
 
     if not results:
         print("All leads already qualified. Nothing new to process.", file=sys.stderr)
