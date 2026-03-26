@@ -100,12 +100,51 @@ def format_videos_for_prompt(videos: list) -> str:
     return "\n\n".join(lines)
 
 
+STOP_WORDS = {
+    "the", "and", "for", "inc", "llc", "ltd", "corp", "group",
+    "solutions", "consulting", "services", "company", "co", "agency",
+    "digital", "media", "marketing", "partners", "with", "from",
+    "that", "this", "your", "our", "its", "has", "are", "was",
+    "have", "been", "not", "but", "you", "all", "can", "her",
+    "his", "they", "them", "their", "ventures", "global", "labs",
+    "studio", "studios", "creative", "brand", "brands", "growth",
+    "strategy", "strategies", "advisory", "advisors", "management",
+    # Generic descriptor words that appear in many company names / descriptions
+    "firm", "unknown", "team", "west", "east", "north", "south",
+    "real", "true", "next", "best", "plus", "pros", "works",
+    "house", "home", "zone", "core", "base", "peak", "edge",
+    "open", "bold", "rise", "wave", "wire", "link", "flow",
+}
+
+
 def _name_match(text: str, person_name: str, company_name: str) -> bool:
-    """Basic overlap check — any word from either name appears in text."""
     text_lower = text.lower()
-    for token in person_name.lower().split() + company_name.lower().split():
-        if len(token) > 2 and token in text_lower:
+
+    def meaningful_tokens(name: str) -> list:
+        return [
+            w for w in name.lower().split()
+            if len(w) > 3 and w not in STOP_WORDS
+        ]
+
+    person_tokens  = meaningful_tokens(person_name)
+    company_tokens = meaningful_tokens(company_name)
+
+    # If we can't extract meaningful tokens, can't disqualify — let it through
+    if not person_tokens and not company_tokens:
+        return True
+
+    # Person name match: ALL meaningful person tokens appear in channel text
+    if person_tokens:
+        if all(t in text_lower for t in person_tokens):
             return True
+
+    # Company name match: at least 2 meaningful company tokens, or 1 if only 1 exists
+    if company_tokens:
+        matches = sum(1 for t in company_tokens if t in text_lower)
+        threshold = min(2, len(company_tokens))
+        if matches >= threshold:
+            return True
+
     return False
 
 
@@ -151,9 +190,16 @@ def _fetch_with_retry(url: str, timeout: int = 10) -> requests.Response | None:
 
 def _discover_channel(person_name: str, company_name: str, website_url: str | None) -> str | None:
     """
-    Run 4-stage channel discovery. Returns a YouTube channel ID or None.
+    4-stage channel discovery:
+      Stage 1: YouTube search by person name
+      Stage 2: YouTube search by company name
+      Stage 3: Scrape company website for YouTube links
+      Stage 4: YouTube search by combined "person name + company name"
+
+    Max quota cost: 300 units per person (3 API searches).
+    Website scraping (Stage 3) is free but may fail silently.
     """
-    # Search 1: by person name
+    # Stage 1: by person name
     try:
         results = search_youtube_channels(person_name)
         for item in results:
@@ -165,8 +211,9 @@ def _discover_channel(person_name: str, company_name: str, website_url: str | No
     except HttpError as e:
         if e.resp.status == 403:
             raise
+    time.sleep(0.3)
 
-    # Search 2: by company name
+    # Stage 2: by company name
     try:
         results = search_youtube_channels(company_name)
         for item in results:
@@ -178,8 +225,9 @@ def _discover_channel(person_name: str, company_name: str, website_url: str | No
     except HttpError as e:
         if e.resp.status == 403:
             raise
+    time.sleep(0.3)
 
-    # Search 3: scrape website for YouTube link
+    # Stage 3: scrape website for YouTube link
     if website_url:
         resp = _fetch_with_retry(website_url)
         if resp and resp.status_code == 200:
@@ -193,20 +241,20 @@ def _discover_channel(person_name: str, company_name: str, website_url: str | No
                         if channel_id:
                             return channel_id
 
-    # Search 4: Google fallback
-    google_url = f'https://www.google.com/search?q="{person_name}" "{company_name}" site:youtube.com'
-    resp = _fetch_with_retry(google_url)
-    if resp and resp.status_code == 200:
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup.find_all("a", href=True):
-            href = tag["href"]
-            if "youtube.com/@" in href or "youtube.com/channel/" in href:
-                clean = href.split("&")[0].replace("/url?q=", "")
-                identifier = find_channel_id_from_url(clean)
-                if identifier:
-                    channel_id = resolve_channel_id(identifier, clean)
-                    if channel_id:
-                        return channel_id
+    # Stage 4: combined person + company search
+    combined_query = f"{person_name} {company_name}"
+    try:
+        results = search_youtube_channels(combined_query, max_results=3)
+        for item in results:
+            snippet = item["snippet"]
+            title = snippet.get("title", "")
+            desc  = snippet.get("description", "")
+            if _name_match(title + " " + desc, person_name, company_name):
+                return snippet["channelId"]
+    except HttpError as e:
+        if e.resp.status == 403:
+            raise
+    time.sleep(0.3)
 
     return None
 
@@ -510,6 +558,14 @@ def qualify_youtube(person_name: str, company_name: str, website_url: str = None
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    if "--test-name-match" in sys.argv:
+        assert _name_match("Mike McCalley Revenue Strategy", "Mike McCalley", "The Vertical Solution")
+        assert _name_match("StraDGy 360 Business Channel", "Zoe Fairfax", "StraDGy 360")
+        assert not _name_match("The Best Marketing Tips Channel", "John Smith", "Solutions Inc")
+        assert _name_match("Anything at all", "Bo Li", "IQ Co")
+        print("All _name_match tests passed.")
+        sys.exit(0)
+
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     no_claude = "--no-claude" in sys.argv
 
