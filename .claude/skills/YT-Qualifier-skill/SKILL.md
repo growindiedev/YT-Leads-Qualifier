@@ -98,55 +98,140 @@ will skip already-processed leads automatically.
 
 ## Step 4 — Enrich each non-ERROR row
 
-For every row where `yt_condition != "ERROR"`, do the following in one pass:
+For every row where `yt_condition` is not `"ERROR"`, do the following in one pass.
 
-### 4a. Stage 2 judgment (only if `yt_condition == "STAGE2_NEEDED"`)
+---
 
-Use the `_yt_videos` array. Refer to `references/conditions.md` for full D vs FAIL criteria.
+### 4a. Handle REVIEW_FAIL rows
+
+`REVIEW_FAIL` means a secondary company (not the primary business) was found to have
+an active polished YouTube channel. The primary company passed. This requires a judgment
+call — do not auto-discard.
+
+Read `_all_company_results` to understand the full picture.
+
+For each REVIEW_FAIL row, write a `why_chosen` note that explains:
+1. What the primary company does and why it qualifies
+2. Which secondary company triggered the FAIL and why it might not matter
+   (e.g. "Their advisory role at BetaCorp has an active channel, but their main
+   business Acme Consulting — where they are founder — has no YouTube presence")
+3. A recommendation: "Recommend manual review before outreach"
+
+Set `confidence` to `"Review Required — Secondary FAIL"`.
+Do NOT discard these rows. Write them to the Leads tab with the REVIEW_FAIL status
+visible so you can make the call.
+
+---
+
+### 4b. Stage 2 judgment (only if `yt_condition == "STAGE2_NEEDED"`)
+
+When a lead has multiple companies and `_all_company_results` is present,
+check if any of those results also have `STAGE2_NEEDED`. If so, evaluate
+each one that needs judgment before applying the resolution rule.
+
+Use the `_yt_videos` array from the relevant company result.
+Refer to `references/conditions.md` for full D vs F vs FAIL criteria.
+
+After assigning each STAGE2_NEEDED result a condition (D, F, or FAIL),
+re-run the resolution rule mentally:
+
+```
+If any company now = FAIL → set yt_condition = FAIL (or REVIEW_FAIL if secondary)
+If all pass → set yt_condition = primary company condition
+```
+
+Update `yt_condition` on the row accordingly.
+
+---
+
+### 4c. Stage 2 single-company judgment (legacy — same as before)
+
+If `_all_company_results` is absent or has only one entry, use the existing
+D vs F vs FAIL criteria from `references/conditions.md` on `_yt_videos`.
 
 **Condition D (good lead — weak content):**
 - Exclusively raw podcast recordings, webinar/Zoom recordings, or interview clips
 - No editing, no motion graphics, no production value
-- Titles suggest episode format: "Ep.", "#123", "with [guest]", "interview", "podcast", "webinar"
+- Titles suggest episode format: "Ep.", "#123", "with [guest]", "interview",
+  "podcast", "webinar"
 - No direct-to-camera scripted content from the founder
 
 **Condition F (good lead — off-topic content):**
 - Posts regularly but content is entirely unrelated to their business/offer
-- Personal vlogs, hobby content, lifestyle, or generic motivational content
+- Personal vlogs, hobby content, or lifestyle content
 - Nothing that would attract or convert their B2B target audience
-- They can show up on camera — they just aren't using it for business
 
 **FAIL (bad lead — strong business content):**
 - Direct-to-camera scripted content from the founder about their industry/offer
 - Produced and edited — custom thumbnails, branded graphics
-- SEO-optimized titles, authority-building or educational content relevant to their business
+- SEO-optimized titles, authority-building or educational content
 - Consistent schedule with no long gaps
 
 If genuinely unclear → default to **Condition D**.
 
-Update `yt_condition` to `D`, `F`, or `FAIL`.
+---
 
-### 4b. Why Chosen (all non-ERROR rows)
+### 4d. Why Chosen — all non-ERROR rows
 
-Write 2–3 sentences:
-1. What they sell / what their company does
-2. Why they fit ContentScale's ICP (selling a service/product, need content-led growth, lack polished YouTube)
-3. What their specific YouTube gap is (based on condition: A=no channel, B=dead, C=inconsistent, D=raw unedited only, E=shorts only, F=off-topic content)
+For single-company leads, write 2–3 sentences:
+1. What the company sells / what their business does
+2. Why they fit ContentScale's ICP (B2B service, need content-led growth, YouTube gap)
+3. What their specific YouTube gap is (based on condition)
 
-Use `_summary`, `_headline`, `_company_description`, `_specialities`, `_industry` as source material.
-Write only from what's available — do not fabricate details.
+For multi-company leads (`multi_company_flag = true`):
+Write 2–3 sentences focused on the PRIMARY company, but include a line about
+the secondary companies if relevant:
+- If a secondary company has a different YouTube status, note it
+- Example: "Alice runs Acme Consulting (B2B sales coaching, no YouTube) and
+  also co-founded Beta SaaS (HR tech, inconsistent channel). Primary outreach
+  target is Acme where she has a clear YouTube gap."
 
-Set `why_chosen` on the row.
+Use `_summary`, `_headline`, `_company_description`, `_specialities`, `_industry`
+as source material. Write only from what's available — do not fabricate details.
 
-### 4c. Confidence (all non-ERROR rows)
+---
+
+### 4e. Confidence — all non-ERROR rows
 
 Set `confidence` to one of:
-- **Normal** — email present, company and role are clear, offer is clear
+
+- **Normal** — email present, company and role are clear, offer is clear,
+  no multi-company ambiguity
+- **Multi-Company** — lead has 2+ active roles; primary was selected by scoring
+  but secondary roles exist. Worth verifying before outreach which company
+  they're most focused on right now.
 - **Low Confidence** — no email, or profile is sparse / hard to reach
 - **Offer Unclear** — cannot determine what they sell from available data
 - **No Active Contacts** — no email and no phone
+- **Review Required — Secondary FAIL** — secondary company has active YouTube;
+  manual check needed before outreach
+- **Offer Flag: UNCLEAR** — website classifier returned UNCLEAR; offer may be
+  B2C or low-ticket, verify before outreach
+- **Offer Flag: FETCH_FAILED** — company website could not be fetched;
+  manually verify the offer before outreach
 
 ---
+
+
+## Score Detail Reference
+
+The `score_detail` JSON written to the "Score Detail" column in the Leads tab
+shows how the primary company was selected. Format:
+
+```json
+{
+  "title":   3,   // Founder/CEO/Owner weight
+  "tenure":  4,   // Months in role (0-5 normalised)
+  "size":    2,   // Company size signal
+  "niche":   2,   // Keyword overlap with target niche
+  "website": 1,   // Has website
+  "desc":    1    // Has company description
+}
+```
+
+Use this to audit cases where the wrong company was selected as primary.
+If title=0 and tenure=0, the scoring had little to work with — consider
+manually verifying which company is their main business before outreach.
 
 ## Step 5 — Remove internal fields
 
@@ -167,26 +252,37 @@ Save the enriched results array to `/tmp/yt_batch_results.json`, then run:
 
 ---
 
-## Step 7 — Print summary
+---
+
+## Step 7 — Updated Print Summary
 
 ```
 BATCH COMPLETE
-─────────────────────────────
-Input:        {n_input} leads
-Skipped:      {n_skipped} already qualified
-Processed:    {n_processed} leads
+─────────────────────────────────────────
+Input:          {n_input} leads
+Skipped:        {n_skipped} already qualified
+Prescreened:    {n_prescreen} discarded (Sales Nav filter mismatch)
+Discarded:      {n_size} — company too large (>50 employees)
+Discarded:      {n_offer} — offer failed (B2C / low-ticket / no website)
 
-DISCARD:      {n} — Website pre-check failed (low-ticket / B2C / no site)
-Condition A:  {n} — No channel
-Condition B:  {n} — Dead channel
-Condition C:  {n} — Inconsistent poster
-Condition D:  {n} — Weak content (good leads ✓)
-Condition E:  {n} — Shorts only (good leads ✓)
-Condition F:  {n} — Off-topic content (good leads ✓)
-FAIL:         {n} — Strong channel (discarded)
-ERROR:        {n} — API failure (retry tomorrow)
+YOUTUBE RESULTS:
+Condition A:    {n} — No channel found              (good leads ✓)
+Condition B:    {n} — Dead channel                  (good leads ✓)
+Condition C:    {n} — Inconsistent poster            (good leads ✓)
+Condition D:    {n} — Weak content / podcast-only   (good leads ✓)
+Condition E:    {n} — Shorts only                   (good leads ✓)
+Condition F:    {n} — Off-topic content             (good leads ✓)
+REVIEW_FAIL:    {n} — Secondary company FAIL        (manual review needed)
+FAIL:           {n} — Active polished channel       (discarded)
+Stage2 Needed: {n} — Awaiting in-session judgment
+ERROR:          {n} — API failure (retry tomorrow)
 
-Good leads:   {A+B+C+D+E+F} written to sheet
+Multi-company leads qualified: {n}
+Good leads (A+B+C+D+E+F):      {n} written to Leads tab
+Review leads (REVIEW_FAIL):    {n} written to Leads tab (flagged)
+Discards total:                {n} written to Discards tab
 
 Results: https://docs.google.com/spreadsheets/d/{sheet_id}
 ```
+
+---

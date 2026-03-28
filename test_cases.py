@@ -21,7 +21,13 @@ Notes on condition coverage:
 
 import sys
 from youtube_qualifier import qualify_youtube
-from batch_qualify import parse_company_size, parse_mismatched_filters
+from batch_qualify import (
+    parse_company_size, parse_mismatched_filters,
+    parse_tenure_months, score_job_title, rank_active_companies,
+)
+from youtube_qualifier import (
+    _extract_youtube_channel_links, _websites_match, resolve_company_youtube_results,
+)
 
 # ---------------------------------------------------------------------------
 # API test cases  (hit YouTube API, require YOUTUBE_API_KEY)
@@ -113,6 +119,66 @@ _FN_MAP = {
 }
 
 
+def run_7a_tests() -> tuple:
+    passed = failed = 0
+    print("\n=== 7A Tests: Multi-Company Scoring ===")
+
+    def check(label, got, expected):
+        nonlocal passed, failed
+        if got == expected:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL  {label}")
+            print(f"        expected: {expected!r}")
+            print(f"        got:      {got!r}")
+
+    # parse_tenure_months
+    assert_gt = [
+        ("parse_tenure_months('01/2021') > 30", parse_tenure_months("01/2021") > 30, True),
+        ("parse_tenure_months('2026') < 6",     parse_tenure_months("2026") < 6,    True),
+        ("parse_tenure_months('')",             parse_tenure_months("") == 0,       True),
+        ("parse_tenure_months('baddata')",      parse_tenure_months("baddata") == 0, True),
+    ]
+    for label, got, expected in assert_gt:
+        check(label, got, expected)
+
+    # score_job_title
+    title_cases = [
+        ("Founder & CEO",          3),
+        ("Co-Founder",             3),
+        ("Board Advisor",          0),
+        ("Marketing Specialist",  -1),
+        ("Head of Sales",          1),
+    ]
+    for title, expected in title_cases:
+        check(f"score_job_title({title!r})", score_job_title(title), expected)
+
+    # rank_active_companies ordering
+    companies = [
+        {
+            "job_title": "Board Advisor", "job_started": "01/2023",
+            "company": "Big Corp", "company_size_count": "500",
+            "company_size_range": "",
+            "company_website": "", "company_description": "",
+            "company_specialities": "", "company_industry": "",
+        },
+        {
+            "job_title": "Founder", "job_started": "01/2020",
+            "company": "My Agency", "company_size_count": "5",
+            "company_size_range": "",
+            "company_website": "myagency.com", "company_description": "B2B consulting",
+            "company_specialities": "", "company_industry": "",
+        },
+    ]
+    ranked = rank_active_companies(companies, target_niche="B2B consulting")
+    check("rank_active_companies: My Agency first", ranked[0]["company"], "My Agency")
+
+    if failed == 0:
+        print(f"  All {passed} 7A tests passed.")
+    return passed, failed
+
+
 # ---------------------------------------------------------------------------
 # Runners
 # ---------------------------------------------------------------------------
@@ -189,13 +255,89 @@ def run_api_tests() -> tuple:
     return passed, failed, quota_used
 
 
-def print_summary(api_passed, api_failed, unit_passed, unit_failed, quota_used, run_api):
+def run_7b_tests() -> tuple:
+    passed = failed = 0
+    print("\n=== 7B Tests: Per-Company YouTube Resolution ===")
+
+    def check(label, got, expected):
+        nonlocal passed, failed
+        if got == expected:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL  {label}")
+            print(f"        expected: {expected!r}")
+            print(f"        got:      {got!r}")
+
+    # _websites_match
+    check("acme.com/about vs acme.com",     _websites_match("https://www.acme.com/about", "http://acme.com"),   True)
+    check("acme.com vs betacorp.com",        _websites_match("https://acme.com", "https://betacorp.com"),        False)
+    check("bare domain vs www domain",       _websites_match("acme.com", "https://www.acme.com"),                True)
+    check("empty vs acme.com",               _websites_match("", "acme.com"),                                    False)
+
+    # _extract_youtube_channel_links
+    from bs4 import BeautifulSoup
+    html = """
+<html><body>
+  <a href="https://www.youtube.com/channel/UCabc123def456">YouTube</a>
+  <a href="https://www.youtube.com/@johnsmith">Handle</a>
+  <a href="https://www.youtube.com/watch?v=xyz">Video</a>
+  <a href="https://youtu.be/abc">Short link</a>
+</body></html>
+"""
+    soup = BeautifulSoup(html, "html.parser")
+    links = _extract_youtube_channel_links(soup)
+    check("extract channel links: count=2", len(links), 2)
+    check("no watch?v= links", all("watch?v=" not in l for l in links), True)
+    check("no youtu.be links", all("youtu.be" not in l for l in links), True)
+
+    # resolve_company_youtube_results — FAIL primary
+    r_primary_fail = [
+        {"condition": "FAIL", "company_name": "Acme", "company_rank": 0,
+         "channel_url": "...", "reasoning": "Active channel", "discovery_source": "website"},
+        {"condition": "C",    "company_name": "Beta", "company_rank": 1,
+         "channel_url": None,  "reasoning": "Inconsistent", "discovery_source": "none"},
+    ]
+    resolved = resolve_company_youtube_results(r_primary_fail)
+    check("FAIL primary → condition=FAIL",            resolved["condition"],       "FAIL")
+    check("FAIL primary → rule=fail_primary",         resolved["resolution_rule"], "fail_primary")
+
+    # resolve_company_youtube_results — secondary FAIL via website
+    r_secondary_fail = [
+        {"condition": "C",    "company_name": "Acme", "company_rank": 0,
+         "channel_url": "...", "reasoning": "Inconsistent", "discovery_source": "website"},
+        {"condition": "FAIL", "company_name": "Beta", "company_rank": 1,
+         "channel_url": "...", "reasoning": "Active", "discovery_source": "website"},
+    ]
+    resolved = resolve_company_youtube_results(r_secondary_fail)
+    check("secondary FAIL website → condition=REVIEW_FAIL",            resolved["condition"],       "REVIEW_FAIL")
+    check("secondary FAIL website → rule=fail_secondary_website",      resolved["resolution_rule"], "fail_secondary_website")
+
+    # resolve_company_youtube_results — all pass, uses primary
+    r_all_pass = [
+        {"condition": "B", "company_name": "Acme", "company_rank": 0,
+         "channel_url": "...", "reasoning": "Dead channel", "discovery_source": "website"},
+        {"condition": "A", "company_name": "Beta", "company_rank": 1,
+         "channel_url": None,  "reasoning": "No channel",   "discovery_source": "none"},
+    ]
+    resolved = resolve_company_youtube_results(r_all_pass)
+    check("all pass → condition=B (primary)",          resolved["condition"],       "B")
+    check("all pass → rule=all_pass_use_primary",      resolved["resolution_rule"], "all_pass_use_primary")
+
+    if failed == 0:
+        print(f"  All {passed} 7B tests passed.")
+    return passed, failed
+
+
+def print_summary(api_passed, api_failed, unit_passed, unit_failed, s7a_passed, s7a_failed, s7b_passed, s7b_failed, quota_used, run_api):
     print(f"\n{'═'*60}")
     print("TEST SUMMARY")
     print(f"{'─'*36}")
     if run_api:
         print(f"API tests:   {api_passed} passed, {api_failed} failed")
     print(f"Unit tests:  {unit_passed} passed, {unit_failed} failed")
+    print(f"7A tests:    {s7a_passed} passed, {s7a_failed} failed")
+    print(f"7B tests:    {s7b_passed} passed, {s7b_failed} failed")
     if run_api:
         print(f"\nEstimated quota used: ~{quota_used} units")
     print(f"{'═'*60}")
@@ -209,12 +351,14 @@ if __name__ == "__main__":
     unit_only = "--unit-only" in sys.argv
 
     unit_passed, unit_failed = run_unit_tests()
+    s7a_passed, s7a_failed   = run_7a_tests()
+    s7b_passed, s7b_failed   = run_7b_tests()
 
     api_passed = api_failed = quota_used = 0
     if not unit_only:
         api_passed, api_failed, quota_used = run_api_tests()
 
-    print_summary(api_passed, api_failed, unit_passed, unit_failed, quota_used, not unit_only)
+    print_summary(api_passed, api_failed, unit_passed, unit_failed, s7a_passed, s7a_failed, s7b_passed, s7b_failed, quota_used, not unit_only)
 
-    total_failed = unit_failed + api_failed
+    total_failed = unit_failed + s7a_failed + s7b_failed + api_failed
     sys.exit(0 if total_failed == 0 else 1)

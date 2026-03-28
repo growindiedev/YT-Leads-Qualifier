@@ -67,6 +67,8 @@ LEADS_HEADERS = [
     "Email Address", "Other Contact Info", "YouTube Channel URL",
     "YouTube Status", "Last LinkedIn Activity", "Why Chosen",
     "Offer Classification", "Confidence", "Multi Company", "All Companies",
+    "Primary Score", "Score Detail",
+    "YouTube Resolution", "Secondary Channels",
 ]
 
 DISCARD_HEADERS = [
@@ -460,19 +462,121 @@ def should_prescreen_discard(profile: dict) -> "tuple[bool, str]":
 
 
 # ---------------------------------------------------------------------------
-# Niche scoring helper
+# Multi-company scoring helpers
 # ---------------------------------------------------------------------------
 
-def score_company_for_niche(company_dict: dict, target_niche: str) -> int:
+def parse_tenure_months(started_on: str) -> int:
     """
-    Score a company against the target niche using keyword overlap.
-    Higher score = better fit. Returns 0 if no niche provided.
+    Parse a job start date string and return how many months the person
+    has been in this role as of today.
+
+    Sales Nav date formats observed:
+      "01/2021"   — MM/YYYY
+      "2021-01"   — YYYY-MM
+      "2021"      — year only
+      ""          — unknown
+
+    Returns 0 if unparseable. Caps at 120 months (10 years).
+    """
+    if not started_on:
+        return 0
+
+    now = datetime.now()
+    s = started_on.strip()
+
+    try:
+        if re.match(r"^\d{2}/\d{4}$", s):
+            dt = datetime.strptime(s, "%m/%Y")
+        elif re.match(r"^\d{4}-\d{2}$", s):
+            dt = datetime.strptime(s, "%Y-%m")
+        elif re.match(r"^\d{4}$", s):
+            dt = datetime(int(s), 1, 1)
+        else:
+            return 0
+
+        months = (now.year - dt.year) * 12 + (now.month - dt.month)
+        return min(max(months, 0), 120)
+    except Exception:
+        return 0
+
+
+def score_job_title(title: str) -> int:
+    """
+    Score a job title by how much operational control it implies.
+
+    3 — Founder, Co-Founder, CEO, Owner, President, Principal
+    2 — Managing Director, Managing Partner, Partner, Director
+    1 — VP, Vice President, Head of, Chief (CRO, CMO, etc.)
+    0 — Advisor, Board Member, Investor, etc.
+   -1 — Employee titles (Manager, Specialist, Coordinator, etc.)
+    """
+    if not title:
+        return 0
+
+    t = title.lower()
+
+    FOUNDER_TITLES  = ["founder", "co-founder", "cofounder", "ceo",
+                       "chief executive", "owner", "president", "principal"]
+    DIRECTOR_TITLES = ["managing director", "managing partner", "partner",
+                       "director"]
+    SENIOR_TITLES   = ["vp ", "vice president", "head of", "chief ",
+                       "cro", "cmo", "cto", "coo", "cpo", "cso"]
+    ADVISOR_TITLES  = ["advisor", "adviser", "board member", "board of",
+                       "investor", "fellow", "emeritus", "volunteer",
+                       "ambassador", "mentor"]
+    EMPLOYEE_TITLES = ["manager", "specialist", "coordinator", "associate",
+                       "analyst", "assistant", "representative", "agent"]
+
+    if any(x in t for x in FOUNDER_TITLES):
+        return 3
+    if any(x in t for x in DIRECTOR_TITLES):
+        return 2
+    if any(x in t for x in SENIOR_TITLES):
+        return 1
+    if any(x in t for x in ADVISOR_TITLES):
+        return 0
+    if any(x in t for x in EMPLOYEE_TITLES):
+        return -1
+    return 1  # unknown title — assume some seniority
+
+
+def score_company_size(size_string: str) -> int:
+    """
+    Score company size as a signal of founder-led small business.
+    We want 1–50 employees.
+    """
+    n = parse_company_size(size_string)
+    if n is None:
+        return 0
+    if n <= 5:
+        return 3
+    if n <= 15:
+        return 2
+    if n <= 50:
+        return 1
+    return -2
+
+
+def score_niche_fit(company_dict: dict, target_niche: str) -> int:
+    """
+    Score how well a company matches the target niche.
+    Returns 0–5 based on keyword overlap.
     """
     if not target_niche:
         return 0
 
-    niche_tokens = set(target_niche.lower().split())
-    score = 0
+    STOP_WORDS = {
+        "the", "and", "for", "inc", "llc", "ltd", "corp", "with",
+        "from", "that", "this", "your", "our", "its", "has", "are",
+        "was", "have", "been", "not", "but", "all", "can"
+    }
+
+    niche_tokens = [
+        w for w in target_niche.lower().split()
+        if len(w) > 3 and w not in STOP_WORDS
+    ]
+    if not niche_tokens:
+        return 0
 
     searchable = " ".join([
         company_dict.get("company_description", ""),
@@ -482,11 +586,79 @@ def score_company_for_niche(company_dict: dict, target_niche: str) -> int:
         company_dict.get("company", ""),
     ]).lower()
 
-    for token in niche_tokens:
-        if len(token) > 3 and token in searchable:
-            score += 1
+    matches = sum(1 for t in niche_tokens if t in searchable)
+    return min(matches, 5)
 
-    return score
+
+def rank_active_companies(active_companies: list, target_niche: str = "") -> list:
+    """
+    Score and rank all active companies for a lead.
+    Returns the list sorted best-first with a 'score' key added to each dict.
+
+    Scoring weights:
+      title_score  * 3  — operational control
+      tenure_score * 2  — long tenure = likely main business
+      size_score   * 2  — small = likely founder-led
+      niche_score  * 1  — niche fit
+      has_website  + 1  — basic viability signal
+      has_desc     + 1  — more established
+    """
+    scored = []
+
+    for company in active_companies:
+        title_score   = score_job_title(company.get("job_title", ""))
+        tenure_months = parse_tenure_months(company.get("job_started", ""))
+
+        if tenure_months < 6:
+            tenure_score = 0
+        elif tenure_months < 12:
+            tenure_score = 1
+        elif tenure_months < 24:
+            tenure_score = 2
+        elif tenure_months < 48:
+            tenure_score = 3
+        elif tenure_months < 72:
+            tenure_score = 4
+        else:
+            tenure_score = 5
+
+        size_score  = score_company_size(
+            company.get("company_size_count", "") or
+            company.get("company_size_range", "")
+        )
+        niche_score = score_niche_fit(company, target_niche)
+        has_website = 1 if company.get("company_website") else 0
+        has_desc    = 1 if company.get("company_description") else 0
+
+        total = (
+            title_score  * 3 +
+            tenure_score * 2 +
+            size_score   * 2 +
+            niche_score  * 1 +
+            has_website      +
+            has_desc
+        )
+
+        scored.append({
+            **company,
+            "score": total,
+            "score_detail": {
+                "title":   title_score,
+                "tenure":  tenure_score,
+                "size":    size_score,
+                "niche":   niche_score,
+                "website": has_website,
+                "desc":    has_desc,
+            }
+        })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored
+
+
+# kept for backwards compat — delegates to score_niche_fit
+def score_company_for_niche(company_dict: dict, target_niche: str) -> int:
+    return score_niche_fit(company_dict, target_niche)
 
 
 # ---------------------------------------------------------------------------
@@ -612,39 +784,41 @@ def process_leads(
     for i, row in enumerate(rows, 1):
         profile = _normalize_row(row)
 
-        # --- Multi-company: log and optionally reassign primary ---
-        if profile["multi_company_flag"]:
-            print(
-                f"  ⚠ Multi-company: {profile['full_name']} has active roles at: "
-                f"{', '.join(profile['all_companies'])}",
-                file=sys.stderr,
-            )
-            scored = [
-                (g, score_company_for_niche(g, target_niche))
-                for g in profile["active_companies"]
-            ]
-            scored.sort(key=lambda x: x[1], reverse=True)
-            best = scored[0][0]
-            if best["company"] != profile["company"]:
+        # --- Multi-company: rank and reassign primary ---
+        ranked = rank_active_companies(
+            profile.get("active_companies", []),
+            target_niche=target_niche,
+        )
+        if ranked:
+            primary = ranked[0]
+            profile["company"]              = primary["company"]
+            profile["job_title"]            = primary["job_title"]
+            profile["company_size"]         = (primary.get("company_size_count") or
+                                               primary.get("company_size_range") or "")
+            profile["company_linkedin_url"] = primary.get("company_linkedin", "")
+            profile["website"]              = primary.get("company_website") or None
+            profile["_company_description"] = primary.get("company_description", "")
+            profile["_specialities"]        = primary.get("company_specialities", "")
+            profile["_industry"]            = primary.get("company_industry", "")
+            profile["primary_score"]        = primary["score"]
+            profile["primary_score_detail"] = primary["score_detail"]
+
+            if profile["multi_company_flag"]:
                 print(
-                    f"  → Reassigned primary to: {best['company']} "
-                    f"(score {scored[0][1]} vs primary {scored[-1][1]})",
+                    f"  ⚠ Multi-company: {profile['full_name']}\n"
+                    f"    Primary (score {ranked[0]['score']}): "
+                    f"{ranked[0]['company']} — {ranked[0]['job_title']}\n" +
+                    "".join(
+                        f"    Other   (score {c['score']}): {c['company']} — {c['job_title']}\n"
+                        for c in ranked[1:]
+                    ),
                     file=sys.stderr,
                 )
-                profile["company"]              = best["company"]
-                profile["company_size"]         = best.get("company_size_count", "") or best.get("company_size_range", "")
-                profile["company_linkedin_url"] = best.get("company_linkedin", "")
-                profile["website"]              = best.get("company_website") or None
-                profile["job_title"]            = best.get("job_title", "")
-                profile["_company_description"] = best.get("company_description", "")
-                profile["_specialities"]        = best.get("company_specialities", "")
-                profile["_industry"]            = best.get("company_industry", "")
 
         profile["all_companies_str"] = " | ".join(profile.get("all_companies", []))
 
         person = profile["full_name"]
         company = profile["company"]
-        website = profile["website"]
 
         if already_done and _is_duplicate(profile, already_done):
             print(f"[{i}/{total}] SKIP (already qualified) — {person} / {company}", file=sys.stderr)
@@ -729,7 +903,13 @@ def process_leads(
         print(f"[{i}/{total}] {person} / {company}", file=sys.stderr)
 
         try:
-            yt = qualify_youtube(person, company, website, no_claude=no_claude)
+            yt = qualify_youtube(
+                person_name=profile["full_name"],
+                company_name=profile["company"],
+                website_url=profile.get("website"),
+                no_claude=no_claude,
+                active_companies=profile.get("active_companies", []),
+            )
         except Exception as exc:
             print(f"  ERROR for {person} / {company}: {exc}", file=sys.stderr)
             results.append(
@@ -740,8 +920,13 @@ def process_leads(
                     "yt_channel_url": None,
                     "yt_channel_name": None,
                     "yt_last_upload": None,
+                    "yt_resolution_rule": "",
+                    "yt_secondary_channels": "",
                     "why_chosen": "",
                     "confidence": "",
+                    "_yt_videos": None,
+                    "_yt_reasoning": "",
+                    "_all_company_results": [],
                 }
             )
             continue
@@ -752,17 +937,18 @@ def process_leads(
         results.append(
             {
                 **profile,
-                "error": None,
-                "yt_condition": condition,
-                "yt_channel_url": yt.get("channel_url"),
-                "yt_channel_name": yt.get("channel_name"),
-                "yt_last_upload": yt.get("last_upload_date"),
-                # Populated by skill after in-session judgment
-                "why_chosen": "",
-                "confidence": "",
-                # Pass-through for skill Stage 2 + insight generation
-                "_yt_videos": yt.get("videos"),  # present only when STAGE2_NEEDED
-                "_yt_reasoning": yt.get("reasoning", ""),
+                "error":                 None,
+                "yt_condition":          condition,
+                "yt_channel_url":        yt.get("channel_url"),
+                "yt_channel_name":       yt.get("channel_name"),
+                "yt_last_upload":        yt.get("last_upload_date"),
+                "yt_resolution_rule":    yt.get("resolution_rule", ""),
+                "yt_secondary_channels": yt.get("secondary_channels", ""),
+                "why_chosen":            "",
+                "confidence":            "",
+                "_yt_videos":            yt.get("videos"),
+                "_yt_reasoning":         yt.get("reasoning", ""),
+                "_all_company_results":  yt.get("all_company_results", []),
             }
         )
 
@@ -880,6 +1066,10 @@ def _build_lead_row(r: dict) -> list:
         r.get("confidence", ""),
         "Yes" if r.get("multi_company_flag") else "No",
         r.get("all_companies_str", ""),
+        r.get("primary_score", ""),
+        json.dumps(r.get("primary_score_detail", {})) if r.get("primary_score_detail") else "",
+        r.get("yt_resolution_rule", ""),
+        r.get("yt_secondary_channels", ""),
     ]
 
 
