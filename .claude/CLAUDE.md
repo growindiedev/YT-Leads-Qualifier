@@ -13,18 +13,32 @@ ideal clients.
 **Qualification order — each gate discards leads before the next runs:**
 
 1. **Dedup** — skips leads already present in the output sheet
-2. **Prescreen** — discards leads whose Sales Nav mismatched-filter column signals
-   the primary company is too large or doesn't match the search criteria
-3. **Size gate** — discards companies with >50 employees
-4. **Multi-company scoring** — if a person has multiple active roles, scores each
+2. **Filter pipeline** — configurable gates run in order via `pipeline_filters.py`;
+   each enabled filter can discard a lead with its own `DISCARD_*` condition:
+   - `DISCARD_PRESCREEN` — Sales Nav mismatched-filter signals
+   - `DISCARD_SIZE` — company outside min/max employee range
+   - `DISCARD_TITLE` — job title not in required list or matches excluded keyword
+   - `DISCARD_LOCATION` — location outside include/exclude list
+   - `DISCARD_INDUSTRY` — LinkedIn industry outside include/exclude list
+   - `DISCARD_KEYWORDS` — required keyword missing or excluded keyword found
+   - `DISCARD_REVENUE` — company revenue outside min/max USD range
+   - `DISCARD_TENURE` — too few months at primary company
+   - `DISCARD_SCORE` — primary company score below threshold
+   - `DISCARD_MULTI_COMPANY` — too many active roles
+   - `DISCARD_CONTACT` — missing required email or LinkedIn
+   - `DISCARD_ACTIVITY` — no LinkedIn activity within configured window
+3. **Multi-company scoring** — if a person has multiple active roles, scores each
    company by title seniority, tenure, size, and niche fit; promotes the best
-   match as the primary company before further checks
-5. **Website classifier** — fetches the company website and keyword-scores it;
-   discards B2C, low-ticket, and leads with no website
-6. **YouTube analysis** — per-company channel discovery (website scrape first,
+   match as the primary company before further checks. Weights are configurable
+   via `pipeline_config.json` `icp.scoring_weights`.
+4. **Website classifier** — fetches the company website and keyword-scores it;
+   discards B2C, low-ticket, and leads with no website. Discard list configurable
+   via `pipeline_config.json` `offer_classifier.discard_on`.
+5. **YouTube analysis** — per-company channel discovery (website scrape first,
    then search) + Stage 1 deterministic checks; rows needing human judgment
-   come back as `STAGE2_NEEDED`
-7. **Stage 2 judgment** — done in-session by the human reviewer via the
+   come back as `STAGE2_NEEDED`. `youtube.max_companies_per_lead` caps quota
+   spend; `youtube.skip_if_no_email` skips YouTube entirely for unreachable leads.
+6. **Stage 2 judgment** — done in-session by the human reviewer via the
    `/qualify-leads` skill (no API cost)
 
 ---
@@ -36,9 +50,13 @@ ideal clients.
 ├── .env                              ← API keys (never commit)
 ├── leads-service-account.json        ← Google service account key (never commit)
 ├── session_counter.json              ← Auto-generated; tracks daily session IDs
+├── pipeline_config.json              ← Filter configuration (all toggles and thresholds)
+├── lead_utils.py                     ← Shared parse/score primitives (no I/O, no HTTP)
+├── pipeline_filters.py               ← Filter functions + apply_filters + load_pipeline_config
 ├── batch_qualify.py                  ← Batch runner, all gates, Sheets writer
 ├── youtube_qualifier.py              ← YouTube channel discovery + qualification
 ├── test_cases.py                     ← Unit + API test suite
+├── DOCS.md                           ← Usage guide and configuration manual
 ├── requirements.txt
 ├── .venv/                            ← Python virtualenv
 └── .claude/
@@ -295,20 +313,28 @@ Non-Sales-Nav CSVs work too — missing columns are silently ignored.
 
 ## Key functions reference
 
-### `batch_qualify.py`
+### `lead_utils.py`
+
+Shared primitives — no I/O, no HTTP. Imported by both `pipeline_filters.py` and `batch_qualify.py`.
 
 | Function | Purpose |
 |----------|---------|
-| `_normalize_row(row)` | Parse one CSV row into a standardised profile dict |
-| `_extract_job_group(row, suffix)` | Extract one Sales Nav job experience group |
 | `parse_company_size(s)` | Parse `"11-50"` / `"47"` / `"myself only"` → int or None |
 | `parse_tenure_months(started_on)` | Parse job start date → months in role |
 | `parse_mismatched_filters(s)` | Parse Sales Nav mismatched filters → `{exp_1: [...]}` |
 | `score_job_title(title)` | Score title by operational control (3=Founder, -1=Specialist) |
 | `score_company_size(size_string)` | Score size as founder-led signal (3=1–5 staff, -2=>50) |
 | `score_niche_fit(company_dict, niche)` | Keyword overlap score against target niche (0–5) |
+| `parse_revenue_bound(value_str)` | Parse revenue bound string like `"1M"` → int |
+| `parse_revenue_range(revenue_str)` | Parse `"1M USD - 2.5M USD"` → `(lower, upper)` |
+
+### `batch_qualify.py`
+
+| Function | Purpose |
+|----------|---------|
+| `_normalize_row(row)` | Parse one CSV row into a standardised profile dict |
+| `_extract_job_group(row, suffix)` | Extract one Sales Nav job experience group |
 | `rank_active_companies(companies, niche)` | Score + sort all active companies, best-first |
-| `should_prescreen_discard(profile)` | Apply prescreen rules → `(bool, reason)` |
 | `classify_website_offer(url)` | Fetch + keyword-score website → `(classification, reason)` |
 | `process_leads(rows, ...)` | Run full pipeline; returns `(results, summary)` |
 | `write_to_sheet(results, sheet_id)` | Write Leads/Discards/Errors tabs |
@@ -354,10 +380,81 @@ Non-Sales-Nav CSVs work too — missing columns are silently ignored.
 ```
 
 Tests are split into suites:
-- **Unit tests** — parse helpers (`parse_company_size`, `parse_mismatched_filters`)
-- **7A tests** — multi-company scoring (`parse_tenure_months`, `score_job_title`, `rank_active_companies`)
+- **Unit tests** — parse helpers from `lead_utils` (`parse_company_size`, `parse_mismatched_filters`)
+- **7A tests** — multi-company scoring from `lead_utils` + `batch_qualify` (`parse_tenure_months`, `score_job_title`, `rank_active_companies`)
 - **7B tests** — YouTube resolution logic (`_websites_match`, `_extract_youtube_channel_links`, `resolve_company_youtube_results`)
 - **API tests** — live YouTube API calls (Condition A, B, STAGE2_NEEDED)
+
+---
+
+## Pipeline config (`pipeline_config.json`)
+
+All filter behaviour is controlled by `pipeline_config.json` in the project root.
+The file is loaded at startup; missing keys fall back to defaults. All new filters
+are **disabled by default** — existing behaviour is unchanged until you turn them on.
+
+### Key sections
+
+| Section | What it controls |
+|---------|-----------------|
+| `input.column_map` | Map CSV column names to standard pipeline names (enables any CSV source) |
+| `input.source_type` | `"sales_navigator"` (default) enables Sales Nav prescreen logic; `"generic"` skips it |
+| `input.multi_company_suffixes` | Column suffixes for multi-job groups (default `["", " (2)", " (3)", " (4)"]`) |
+| `size_gate` | `min_employees` / `max_employees` (default 1–50) |
+| `prescreen.rules` | Toggle each Sales Nav mismatch rule independently |
+| `title_filter` | `require_any` / `exclude_any` keyword lists on job title |
+| `location_filter` | `include` or `exclude` mode + location substring list |
+| `industry_filter` | `include` or `exclude` mode + LinkedIn industry list |
+| `keyword_filter` | `require_any` / `exclude_any` on `company_description` / `company_specialities` |
+| `revenue_filter` | `min_usd` / `max_usd` against LinkedIn revenue range |
+| `tenure_filter` | `min_months_at_primary` — minimum time at primary company |
+| `primary_score_filter` | `min_score` / `min_score_margin` — multi-company scoring floor |
+| `multi_company_filter` | `max_active_roles` — discard leads with too many active roles |
+| `contact_filter` | `require_email` / `require_linkedin` booleans |
+| `activity_filter` | `max_days_since_activity` — LinkedIn activity recency |
+| `offer_classifier.discard_on` | List of offer classifications that cause `DISCARD_OFFER` |
+| `youtube.skip_if_no_email` | Skip YouTube API for leads with no email (saves quota) |
+| `youtube.max_companies_per_lead` | Cap how many companies get YouTube-checked per lead |
+| `icp.target_niche` | Overrides `TARGET_NICHE` env var for multi-company scoring |
+| `icp.scoring_weights` | Override `title`/`tenure`/`size`/`niche` multipliers |
+
+### Using a non-Sales-Navigator CSV
+
+```json
+{
+  "input": {
+    "source_type": "generic",
+    "column_map": {
+      "first name":   "First Name",
+      "last name":    "Last Name",
+      "linkedin url": "Profile URL",
+      "corporate website": "Website"
+    }
+  },
+  "prescreen": { "enabled": false }
+}
+```
+
+### Custom config path
+
+```bash
+.venv/bin/python3 batch_qualify.py --input leads.csv --output-sheet SHEET_ID \
+  --no-claude --config /path/to/my_config.json
+```
+
+### Adding a new filter
+
+1. Write a function in `pipeline_filters.py`:
+   ```python
+   def filter_my_rule(profile: dict, config: dict) -> FilterResult:
+       cfg = config.get("my_rule", {})
+       if not cfg.get("enabled", False):
+           return _PASS
+       # ... logic ...
+       return FilterResult(True, "DISCARD_MY_RULE", "reason string")
+   ```
+2. Append it to `FILTER_PIPELINE` in `pipeline_filters.py`
+3. Add its config section to `pipeline_config.json`
 
 ---
 
@@ -376,3 +473,59 @@ Tests are split into suites:
   processed leads, so you can re-run the next day without losing progress.
 - **`REVIEW_FAIL`** means a secondary company has an active channel — review manually
   before dismissing, as the person may have abandoned that channel.
+
+---
+
+## Code style guide
+
+### Module responsibilities
+
+| Module | What it owns | What it must NOT do |
+|--------|-------------|---------------------|
+| `lead_utils.py` | Parse/score primitives | I/O, HTTP, pipeline logic |
+| `pipeline_filters.py` | Filter functions, config loading, `apply_filters` | Import from `batch_qualify` |
+| `batch_qualify.py` | Orchestration, HTTP/Sheets I/O, website classifier | Define parse/score primitives |
+| `youtube_qualifier.py` | YouTube discovery + Stage 1/2 logic | Import from `batch_qualify` |
+
+**Import direction:** `batch_qualify` → `pipeline_filters` → `lead_utils`. No circular imports.
+
+### Single Responsibility
+
+- Every function does one thing. If a function fetches data AND scores it AND makes a decision, split it.
+- Every filter function has the signature `filter_x(profile, config) -> FilterResult`. No side effects.
+- Adding a new filter means: new function + append to `FILTER_PIPELINE` + add config key. Nothing else changes.
+
+### Open / Closed
+
+- The filter pipeline is open for extension (append to `FILTER_PIPELINE`), closed for modification (never edit the `apply_filters` loop).
+- The scoring system is open via `icp.scoring_weights` in config — do not add new hardcoded multipliers.
+
+### No magic numbers
+
+All thresholds belong in `pipeline_config.json`. If you find yourself writing `if size > 50` in code, it should be `if size > cfg.get("max_employees", 50)`.
+
+### No dead code
+
+- Remove superseded functions immediately. Do not keep backwards-compat aliases.
+- Do not comment out code — delete it. Git history is the record.
+
+### DRY — single source of truth
+
+- Parse/score utilities live in `lead_utils.py` only. If you need `parse_company_size` anywhere, import it from there.
+- Config defaults live in `pipeline_filters._DEFAULTS` only. Do not duplicate default values in code.
+
+### Small functions, descriptive names
+
+- Prefer many small functions over one large one.
+- Names should read as sentences: `filter_tenure`, `classify_website_offer`, `rank_active_companies`.
+- No flag arguments — split into separate functions instead.
+
+### Tests
+
+- Unit tests cover all `lead_utils` parse/score functions.
+- 7A tests cover multi-company scoring end-to-end.
+- 7B tests cover YouTube resolution logic.
+- Run `test_cases.py --unit-only` before every commit. It takes under 2 seconds and needs no API key.
+
+----
+

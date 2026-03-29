@@ -120,14 +120,21 @@ STOP_WORDS = {
 def _name_match(text: str, person_name: str, company_name: str) -> bool:
     text_lower = text.lower()
 
-    def meaningful_tokens(name: str) -> list:
+    def meaningful_tokens(name: str, min_len: int = 4) -> list:
         return [
             w for w in name.lower().split()
-            if len(w) > 3 and w not in STOP_WORDS
+            if len(w) > min_len and w not in STOP_WORDS
         ]
 
-    person_tokens  = meaningful_tokens(person_name)
-    company_tokens = meaningful_tokens(company_name)
+    person_tokens  = meaningful_tokens(person_name, min_len=4)
+    company_tokens = meaningful_tokens(company_name, min_len=4)
+
+    # Fallback: if filtering removed all tokens from a short name
+    # (e.g. "Bo Li", "Wen Ho"), relax to catch short surnames too
+    if not person_tokens:
+        person_tokens = meaningful_tokens(person_name, min_len=2)
+    if not company_tokens:
+        company_tokens = meaningful_tokens(company_name, min_len=2)
 
     # If we can't extract meaningful tokens, can't disqualify — let it through
     if not person_tokens and not company_tokens:
@@ -231,6 +238,21 @@ def _resolve_youtube_url_to_channel_id(url: str) -> str | None:
     return resolve_channel_id(identifier, url)
 
 
+def _get_channel_subscriber_count(channel_id: str) -> "int | None":
+    """Return subscriber count or None on failure. Costs 1 quota unit."""
+    try:
+        resp = youtube.channels().list(
+            part="statistics", id=channel_id
+        ).execute()
+        items = resp.get("items", [])
+        if not items:
+            return None
+        count_str = items[0]["statistics"].get("subscriberCount", "")
+        return int(count_str) if count_str else None
+    except Exception:
+        return None
+
+
 def _get_channel_website(channel_id: str) -> str | None:
     """
     Attempt to retrieve the website URL listed on a YouTube channel's About page.
@@ -330,9 +352,17 @@ def _scrape_website_for_channel(
         except Exception:
             continue
 
-    # Validation failed but the website linked to this channel — return it anyway
-    fallback_id = _resolve_youtube_url_to_channel_id(found_links[0])
-    return fallback_id
+    # Validation failed. Only use fallback if exactly ONE channel link was found
+    # — a single link is almost certainly theirs. Multiple links = ambiguous.
+    if len(found_links) == 1:
+        fallback_id = _resolve_youtube_url_to_channel_id(found_links[0])
+        return fallback_id
+
+    logger.info(
+        f"  Found {len(found_links)} YouTube links on {base_url} "
+        f"but none passed name validation. Skipping."
+    )
+    return None
 
 
 def _search_and_validate(
@@ -369,11 +399,29 @@ def _search_and_validate(
         if not _name_match(title + " " + desc, person_name, company_name):
             continue
 
-        if require_cross_validation and company_website:
-            channel_website = _get_channel_website(channel_id)
-            if channel_website:
-                if not _websites_match(channel_website, company_website):
-                    continue  # wrong channel — website mismatch
+        if require_cross_validation:
+            # Reject channels with >200K subscribers — established creators
+            # that crowd out the real target in search results
+            sub_count = _get_channel_subscriber_count(channel_id)
+            if sub_count is not None and sub_count > 200000:
+                logger.info(
+                    f"  Skipping channel {channel_id}: "
+                    f"{sub_count:,} subscribers (too large)"
+                )
+                continue
+
+            # Secondary check: if channel lists a website and it doesn't
+            # match, it's a definitive mismatch — skip it.
+            if company_website:
+                channel_website = _get_channel_website(channel_id)
+                if channel_website and not _websites_match(
+                    channel_website, company_website
+                ):
+                    logger.info(
+                        f"  Skipping channel {channel_id}: "
+                        f"website mismatch ({channel_website} vs {company_website})"
+                    )
+                    continue
 
         channel_url = f"https://www.youtube.com/channel/{channel_id}"
         return {"channel_id": channel_id, "channel_url": channel_url}

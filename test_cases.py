@@ -21,10 +21,11 @@ Notes on condition coverage:
 
 import sys
 from youtube_qualifier import qualify_youtube
-from batch_qualify import (
+from lead_utils import (
     parse_company_size, parse_mismatched_filters,
-    parse_tenure_months, score_job_title, rank_active_companies,
+    parse_tenure_months, score_job_title,
 )
+from batch_qualify import rank_active_companies
 from youtube_qualifier import (
     _extract_youtube_channel_links, _websites_match, resolve_company_youtube_results,
 )

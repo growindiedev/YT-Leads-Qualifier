@@ -34,6 +34,14 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # Allow running from any directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from youtube_qualifier import qualify_youtube
+from pipeline_filters import apply_filters, load_pipeline_config, remap_row
+from lead_utils import (
+    parse_company_size,
+    parse_tenure_months,
+    score_job_title,
+    score_company_size,
+    score_niche_fit,
+)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -69,6 +77,7 @@ LEADS_HEADERS = [
     "Offer Classification", "Confidence", "Multi Company", "All Companies",
     "Primary Score", "Score Detail",
     "YouTube Resolution", "Secondary Channels",
+    "Revenue Confidence", "Revenue Score",
 ]
 
 DISCARD_HEADERS = [
@@ -262,12 +271,18 @@ def _extract_job_group(row: dict, suffix: str = "") -> dict:
     }
 
 
-def _normalize_row(row: dict) -> dict:
+def _normalize_row(row: dict, suffixes: list = None) -> dict:
     """
     Extract all relevant fields from a row, handling up to 4 job experience
     groups from Sales Nav exports (primary + suffixes " (2)", " (3)", " (4)").
     Returns a dict with standardised keys ready for output and qualification.
+
+    suffixes: list of job-group column suffixes to scan. Defaults to
+              ["", " (2)", " (3)", " (4)"]. Override via pipeline_config.json
+              input.multi_company_suffixes for non-Sales-Nav CSVs.
     """
+    if suffixes is None:
+        suffixes = ["", " (2)", " (3)", " (4)"]
 
     def get(*keys):
         for k in keys:
@@ -278,7 +293,7 @@ def _normalize_row(row: dict) -> dict:
 
     # Collect all job groups
     groups = []
-    for suffix in ["", " (2)", " (3)", " (4)"]:
+    for suffix in suffixes:
         group = _extract_job_group(row, suffix)
         if group:
             groups.append(group)
@@ -308,6 +323,7 @@ def _normalize_row(row: dict) -> dict:
                                or primary.get("company_size_range", ""),
         "company_linkedin_url": primary.get("company_linkedin", ""),
         "website":             primary.get("company_website") or None,
+        "company_revenue":     primary.get("company_revenue", ""),
 
         # Multi-company fields
         "multi_company_flag": len(active_groups) > 1,
@@ -326,6 +342,9 @@ def _normalize_row(row: dict) -> dict:
         # Sales Nav filter signals (used by prescreen gate)
         "_mismatched_filters":   get("mismatched filters"),
         "_matching_filters":     get("matching filters"),
+
+        # Activity signal (used by activity_filter)
+        "last_activity":         get("last linkedin activity", "last activity"),
     }
 
 
@@ -342,7 +361,31 @@ HIGH_TICKET_B2B_SIGNALS = [
     "for teams", "work with us", "our clients", "client results",
     "b2b", "enterprise clients", "corporate clients", "speaking fee",
     "speaking engagement", "keynote", "workshop", "mastermind",
-    "accelerator program", "investment required"
+    "accelerator program", "investment required",
+    # Common B2B CTA variants
+    "let's talk", "lets talk", "get in touch", "book a meeting",
+    "free consultation", "free discovery", "discovery call",
+    "strategy call", "clarity call", "sales call",
+    # Content signals
+    "case studies", "case study", "how we work", "our process",
+    "who we work with", "client success", "industries we serve",
+    # Growth/outcome language
+    "scale your", "grow your business", "increase revenue",
+    "sales pipeline", "mid-market", "enterprise",
+    # Identity signals
+    "ceo", "chief executive", "b2b saas", "service business",
+    "agency owner", "consulting firm", "coaching business",
+    # Engagement model
+    "1-on-1", "one-on-one", "monthly retainer", "quarterly",
+    "engagement", "proposal", "done with you",
+]
+
+STRONG_B2B_SIGNALS = [
+    "book a call", "book a discovery", "discovery call", "strategy call",
+    "clarity call", "sales call", "apply now", "schedule a call", "retainer",
+    "done-for-you", "done for you", "fractional cmo", "fractional coo",
+    "fractional cfo", "executive coaching", "management consulting",
+    "application required", "apply to work with",
 ]
 
 B2C_SIGNALS = [
@@ -364,238 +407,329 @@ LOW_TICKET_SIGNALS = [
 ]
 
 
-def classify_website_offer(url: "str | None") -> "tuple[str, str]":
+def _classify_text(text: str) -> "tuple[str, str]":
+    """Score a block of lowercased page text and return (classification, reason)."""
+    strong_b2b = sum(1 for s in STRONG_B2B_SIGNALS if s in text)
+    b2b_score  = sum(1 for s in HIGH_TICKET_B2B_SIGNALS if s in text)
+    b2c_score  = sum(1 for s in B2C_SIGNALS if s in text)
+    low_score  = sum(1 for s in LOW_TICKET_SIGNALS if s in text)
+
+    # Strong B2B signals trump everything
+    if strong_b2b >= 1:
+        return ("HIGH_TICKET_B2B", f"Strong B2B signal: {strong_b2b}")
+    if b2b_score >= 2:
+        return ("HIGH_TICKET_B2B", f"B2B signals: {b2b_score}")
+    if b2b_score == 1 and b2c_score == 0 and low_score == 0:
+        return ("HIGH_TICKET_B2B", "Weak B2B signal, no counter-signals")
+    if b2c_score >= 2:
+        return ("B2C", f"B2C signals: {b2c_score}")
+    if low_score >= 2:
+        return ("LOW_TICKET", f"Low-ticket signals: {low_score}")
+
+    return ("UNCLEAR", f"B2B:{b2b_score} B2C:{b2c_score} Low:{low_score}")
+
+
+_WEBSITE_CLASSIFIER_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ContentScaleBot/1.0)"}
+_FALLBACK_PATHS = ["/services", "/work-with-me", "/how-it-works",
+                   "/offerings", "/coaching", "/consulting", "/about"]
+
+
+def _fetch_page_text(url: str, char_limit: int = 3500) -> "tuple[str, str] | None":
+    """
+    Fetch a URL and return (lowercased_text, base_scheme_host).
+    Returns None on failure. Extracts title + meta description before stripping tags.
+    """
+    from urllib.parse import urlparse
+    try:
+        resp = requests.get(url, headers=_WEBSITE_CLASSIFIER_HEADERS, timeout=6)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Extract title and meta description before stripping tags
+        title_tag = soup.find("title")
+        meta_desc = soup.find("meta", attrs={"name": "description"})
+        og_desc   = soup.find("meta", attrs={"property": "og:description"})
+        title_text = title_tag.get_text(strip=True) if title_tag else ""
+        meta_text  = (meta_desc.get("content", "") if meta_desc else "") or \
+                     (og_desc.get("content", "") if og_desc else "")
+        prefix = (title_text + " " + meta_text + " ").lower()
+
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        body_text = soup.get_text(separator=" ", strip=True)[:char_limit].lower()
+
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        return (prefix + body_text, base)
+    except Exception:
+        return None
+
+
+CASE_STUDY_SIGNALS = [
+    "case study", "case studies", "client story", "client stories",
+    "success story", "success stories", "our work", "portfolio",
+    "client results", "before and after", "transformation",
+    "how we helped", "how i helped", "client wins", "recent wins",
+]
+
+TESTIMONIAL_SIGNALS = [
+    "testimonial", "testimonials", "what clients say", "what our clients say",
+    "client feedback", "hear from", "trusted by", "they say",
+    "client spotlight", "what they say", "don't take our word",
+    "here's what", "in their words", "client reviews",
+]
+
+ROI_LANGUAGE_SIGNALS = [
+    "revenue", "pipeline", "generated", "increased by", "grew by",
+    "percent", " roi", "return on investment", "leads generated",
+    "clients signed", "deals closed", "booked", "within 90 days",
+    "within 60 days", "within 6 months", "doubled", "tripled",
+    "scaled", "from zero to", "in 30 days", "in 60 days",
+    "qualified leads", "sales calls", "discovery calls booked",
+    "new clients", "added to pipeline", "in new revenue",
+]
+
+DOLLAR_SIGNALS = [
+    "$", "k per month", "k/month", "k in revenue", "m in revenue",
+    "million", "six figures", "seven figures", "six-figure", "seven-figure",
+    "100k", "250k", "500k", "per year", "annually",
+]
+
+SOCIAL_PROOF_PAGES = [
+    "/case-studies", "/case-study", "/testimonials", "/reviews",
+    "/results", "/success-stories", "/client-stories", "/clients",
+    "/our-work", "/portfolio", "/proof",
+]
+
+
+def _has_colocated_signals(
+    text: str, primary: list, secondary: list, window: int = 500
+) -> bool:
+    """
+    Return True if any secondary signal appears within `window` chars
+    of any primary signal in the text.
+    """
+    for p in primary:
+        idx = text.find(p)
+        while idx != -1:
+            surrounding = text[max(0, idx - window): idx + len(p) + window]
+            if any(s in surrounding for s in secondary):
+                return True
+            idx = text.find(p, idx + 1)
+    return False
+
+
+def _detect_social_proof(text: str) -> dict:
+    """
+    Scan page text for social proof signals.
+    Returns a dict with has_* bools and a total social_proof_score.
+    """
+    text = text.lower()
+    proof_signals = CASE_STUDY_SIGNALS + TESTIMONIAL_SIGNALS
+
+    has_case_studies   = any(s in text for s in CASE_STUDY_SIGNALS)
+    has_testimonials   = any(s in text for s in TESTIMONIAL_SIGNALS)
+    has_roi_language   = (
+        _has_colocated_signals(text, proof_signals, ROI_LANGUAGE_SIGNALS)
+        if (has_case_studies or has_testimonials) else False
+    )
+    has_dollar_amounts = (
+        _has_colocated_signals(text, proof_signals, DOLLAR_SIGNALS)
+        if (has_case_studies or has_testimonials) else False
+    )
+
+    score = 0
+    if has_case_studies:
+        score += 3
+    if has_testimonials:
+        score += 1
+    if has_roi_language:
+        score += 2
+    if has_dollar_amounts:
+        score += 2
+
+    return {
+        "has_case_studies":   has_case_studies,
+        "has_testimonials":   has_testimonials,
+        "has_roi_language":   has_roi_language,
+        "has_dollar_amounts": has_dollar_amounts,
+        "social_proof_score": score,
+    }
+
+
+def classify_website_offer(
+    url: "str | None",
+) -> "tuple[str, str, str]":
+    """
+    Returns (classification, reason, combined_text) where combined_text
+    is the homepage + social-proof page text for use with _detect_social_proof.
+    combined_text is "" on fetch failure.
+    """
     if not url:
-        return ("NO_WEBSITE", "No website URL available")
+        return ("NO_WEBSITE", "No website URL available", "")
 
     if not url.startswith("http"):
         url = "https://" + url
 
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; ContentScaleBot/1.0)"}
-        resp = requests.get(url, headers=headers, timeout=6)
-        if resp.status_code != 200:
-            return ("FETCH_FAILED", f"HTTP {resp.status_code}")
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
-        text = soup.get_text(separator=" ", strip=True)[:4000].lower()
+        result = _fetch_page_text(url)
     except requests.Timeout:
-        return ("FETCH_FAILED", "Request timed out")
+        return ("FETCH_FAILED", "Request timed out", "")
     except Exception as e:
-        return ("FETCH_FAILED", str(e)[:80])
+        return ("FETCH_FAILED", str(e)[:80], "")
 
-    b2b_score = sum(1 for s in HIGH_TICKET_B2B_SIGNALS if s in text)
-    b2c_score = sum(1 for s in B2C_SIGNALS if s in text)
-    low_score = sum(1 for s in LOW_TICKET_SIGNALS if s in text)
+    if result is None:
+        return ("FETCH_FAILED", "Could not fetch page", "")
 
-    if b2c_score >= 2:
-        return ("B2C", f"B2C signals: {b2c_score}")
-    if low_score >= 2:
-        return ("LOW_TICKET", f"Low-ticket signals: {low_score}")
-    if b2b_score >= 2:
-        return ("HIGH_TICKET_B2B", f"B2B signals: {b2b_score}")
-    if b2b_score == 1 and b2c_score == 0 and low_score == 0:
-        return ("HIGH_TICKET_B2B", "Weak B2B signal, no counter-signals")
+    text, base = result
+    classification, reason = _classify_text(text)
 
-    return ("UNCLEAR", f"B2B:{b2b_score} B2C:{b2c_score} Low:{low_score}")
+    if classification == "UNCLEAR":
+        # Try each fallback page in order; stop at first non-UNCLEAR result
+        for path in _FALLBACK_PATHS:
+            fallback = _fetch_page_text(base + path, char_limit=2000)
+            if fallback is None:
+                continue
+            fb_text, _ = fallback
+            fb_class, fb_reason = _classify_text(fb_text)
+            if fb_class != "UNCLEAR":
+                return (fb_class, fb_reason + f" (from {path})", text + " " + fb_text)
+
+    # Try to find a social proof page and append its text
+    social_text = ""
+    for sp_path in SOCIAL_PROOF_PAGES:
+        sp_result = _fetch_page_text(base + sp_path, char_limit=2000)
+        if sp_result is not None:
+            social_text = sp_result[0]
+            break
+
+    return (classification, reason, text + " " + social_text)
 
 
 # ---------------------------------------------------------------------------
-# Mismatched-filter pre-screen helpers
+# Revenue confidence scoring
 # ---------------------------------------------------------------------------
 
-def parse_mismatched_filters(mismatched: str) -> dict:
+def score_revenue_range(revenue_string: str) -> int:
+    """Parse LinkedIn revenue range string and return a confidence score."""
+    if not revenue_string:
+        return 0
+    r = revenue_string.lower().replace(",", "")
+    if any(x in r for x in ["100m", "500m", "1b", "10b"]):
+        return 1
+    if any(x in r for x in ["10m", "20m", "50m"]):
+        return 2
+    if any(x in r for x in ["2.5m", "5m"]):
+        return 4
+    if "1m usd" in r or "1m -" in r:
+        return 4
+    if "500t" in r:
+        return 2
+    return 0
+
+
+def estimate_revenue_confidence(
+    profile: dict,
+    social_proof: dict = None,
+) -> "tuple[str, int, dict]":
     """
-    Parse the mismatched filters string into a dict keyed by experience slot.
-    Returns e.g. {"exp_1": ["employee count", "industry"], "exp_2": ["job"]}
+    Score a lead's likelihood of being a $25k+/month business.
+    Returns (confidence_label, total_score, score_breakdown).
+    Labels: "High" (>=12), "Medium" (>=8), "Low" (>=4), "Unknown" (<4)
     """
-    result = {}
-    if not mismatched:
-        return result
-    for segment in mismatched.split("|"):
-        segment = segment.strip()
-        match = re.match(r"(exp_\d+):\s*(.+)", segment)
-        if match:
-            exp_key = match.group(1).strip()
-            reasons = [r.strip() for r in match.group(2).split(",")]
-            result[exp_key] = reasons
-    return result
+    # Revenue range
+    rev_pts = score_revenue_range(profile.get("company_revenue", ""))
+
+    # Company size
+    size = parse_company_size(profile.get("company_size", ""))
+    if size is None:
+        size_pts = 0
+    elif size <= 5:
+        size_pts = 2
+    elif size <= 20:
+        size_pts = 3
+    elif size <= 50:
+        size_pts = 2
+    else:
+        size_pts = 0
+
+    # Title
+    title_raw = score_job_title(profile.get("job_title", ""))
+    title_pts = max(0, title_raw) if title_raw <= 3 else 0
+    # map: 3→3, 2→2, 1→1, 0→0, -1→0
+
+    # Tenure
+    months = parse_tenure_months(profile.get("job_started", ""))
+    if months >= 48:
+        tenure_pts = 3
+    elif months >= 24:
+        tenure_pts = 2
+    elif months >= 12:
+        tenure_pts = 1
+    else:
+        tenure_pts = 0
+
+    # Social proof
+    sp = social_proof or {}
+    case_pts  = 3 if sp.get("has_case_studies") else 0
+    test_pts  = 1 if sp.get("has_testimonials") else 0
+    roi_pts   = 2 if sp.get("has_roi_language") else 0
+    dollar_pts = 2 if sp.get("has_dollar_amounts") else 0
+
+    # Offer strength
+    offer_class  = profile.get("offer_classification", "")
+    offer_reason = profile.get("_offer_reason", "")
+    if offer_class == "HIGH_TICKET_B2B" and "strong" in offer_reason.lower():
+        offer_pts = 2
+    elif offer_class == "HIGH_TICKET_B2B":
+        offer_pts = 1
+    else:
+        offer_pts = 0
+
+    total = (rev_pts + size_pts + title_pts + tenure_pts
+             + case_pts + test_pts + roi_pts + dollar_pts + offer_pts)
+
+    if total >= 12:
+        label = "High"
+    elif total >= 8:
+        label = "Medium"
+    elif total >= 4:
+        label = "Low"
+    else:
+        label = "Unknown"
+
+    breakdown = {
+        "revenue_range":  rev_pts,
+        "size":           size_pts,
+        "title":          title_pts,
+        "tenure":         tenure_pts,
+        "case_studies":   case_pts,
+        "testimonials":   test_pts,
+        "roi_language":   roi_pts,
+        "dollar_amounts": dollar_pts,
+        "offer_strength": offer_pts,
+        "total":          total,
+    }
+    return (label, total, breakdown)
 
 
-def should_prescreen_discard(profile: dict) -> "tuple[bool, str]":
-    """
-    Return (True, reason) if the lead should be discarded based on Sales Nav
-    mismatched-filter signals, otherwise (False, "").
-    """
-    mismatch = parse_mismatched_filters(profile.get("_mismatched_filters", ""))
-
-    if mismatch:
-        # Build active exp keys — exp_1 always included; add more if multi-company
-        if profile.get("multi_company_flag"):
-            n = len(profile.get("active_companies", []))
-            active_exp_keys = [f"exp_{i+1}" for i in range(n)]
-        else:
-            active_exp_keys = ["exp_1"]
-
-        # Rule 1: primary company has employee count mismatch → discard
-        if "employee count" in mismatch.get("exp_1", []):
-            return (True, "Sales Nav: primary company employee count mismatch")
-
-        # Rule 2: ALL active slots have employee count mismatch → discard
-        all_active_have_count_mismatch = all(
-            "employee count" in mismatch.get(k, [])
-            for k in active_exp_keys
-            if k in mismatch
-        )
-        if len(active_exp_keys) > 1 and all_active_have_count_mismatch:
-            return (True, "Sales Nav: all active companies employee count mismatch")
-
-        # Rule 3: only secondary slots have employee count mismatch → pass
-        # (primary is fine; fall through)
-
-    # Rule 4: matching_filters explicitly false → discard
-    if profile.get("_matching_filters", "").strip().lower() == "false":
-        return (True, "Sales Nav: lead does not match search filters")
-
-    return (False, "")
 
 
 # ---------------------------------------------------------------------------
 # Multi-company scoring helpers
 # ---------------------------------------------------------------------------
 
-def parse_tenure_months(started_on: str) -> int:
-    """
-    Parse a job start date string and return how many months the person
-    has been in this role as of today.
-
-    Sales Nav date formats observed:
-      "01/2021"   — MM/YYYY
-      "2021-01"   — YYYY-MM
-      "2021"      — year only
-      ""          — unknown
-
-    Returns 0 if unparseable. Caps at 120 months (10 years).
-    """
-    if not started_on:
-        return 0
-
-    now = datetime.now()
-    s = started_on.strip()
-
-    try:
-        if re.match(r"^\d{2}/\d{4}$", s):
-            dt = datetime.strptime(s, "%m/%Y")
-        elif re.match(r"^\d{4}-\d{2}$", s):
-            dt = datetime.strptime(s, "%Y-%m")
-        elif re.match(r"^\d{4}$", s):
-            dt = datetime(int(s), 1, 1)
-        else:
-            return 0
-
-        months = (now.year - dt.year) * 12 + (now.month - dt.month)
-        return min(max(months, 0), 120)
-    except Exception:
-        return 0
-
-
-def score_job_title(title: str) -> int:
-    """
-    Score a job title by how much operational control it implies.
-
-    3 — Founder, Co-Founder, CEO, Owner, President, Principal
-    2 — Managing Director, Managing Partner, Partner, Director
-    1 — VP, Vice President, Head of, Chief (CRO, CMO, etc.)
-    0 — Advisor, Board Member, Investor, etc.
-   -1 — Employee titles (Manager, Specialist, Coordinator, etc.)
-    """
-    if not title:
-        return 0
-
-    t = title.lower()
-
-    FOUNDER_TITLES  = ["founder", "co-founder", "cofounder", "ceo",
-                       "chief executive", "owner", "president", "principal"]
-    DIRECTOR_TITLES = ["managing director", "managing partner", "partner",
-                       "director"]
-    SENIOR_TITLES   = ["vp ", "vice president", "head of", "chief ",
-                       "cro", "cmo", "cto", "coo", "cpo", "cso"]
-    ADVISOR_TITLES  = ["advisor", "adviser", "board member", "board of",
-                       "investor", "fellow", "emeritus", "volunteer",
-                       "ambassador", "mentor"]
-    EMPLOYEE_TITLES = ["manager", "specialist", "coordinator", "associate",
-                       "analyst", "assistant", "representative", "agent"]
-
-    if any(x in t for x in FOUNDER_TITLES):
-        return 3
-    if any(x in t for x in DIRECTOR_TITLES):
-        return 2
-    if any(x in t for x in SENIOR_TITLES):
-        return 1
-    if any(x in t for x in ADVISOR_TITLES):
-        return 0
-    if any(x in t for x in EMPLOYEE_TITLES):
-        return -1
-    return 1  # unknown title — assume some seniority
-
-
-def score_company_size(size_string: str) -> int:
-    """
-    Score company size as a signal of founder-led small business.
-    We want 1–50 employees.
-    """
-    n = parse_company_size(size_string)
-    if n is None:
-        return 0
-    if n <= 5:
-        return 3
-    if n <= 15:
-        return 2
-    if n <= 50:
-        return 1
-    return -2
-
-
-def score_niche_fit(company_dict: dict, target_niche: str) -> int:
-    """
-    Score how well a company matches the target niche.
-    Returns 0–5 based on keyword overlap.
-    """
-    if not target_niche:
-        return 0
-
-    STOP_WORDS = {
-        "the", "and", "for", "inc", "llc", "ltd", "corp", "with",
-        "from", "that", "this", "your", "our", "its", "has", "are",
-        "was", "have", "been", "not", "but", "all", "can"
-    }
-
-    niche_tokens = [
-        w for w in target_niche.lower().split()
-        if len(w) > 3 and w not in STOP_WORDS
-    ]
-    if not niche_tokens:
-        return 0
-
-    searchable = " ".join([
-        company_dict.get("company_description", ""),
-        company_dict.get("company_specialities", ""),
-        company_dict.get("company_industry", ""),
-        company_dict.get("job_title", ""),
-        company_dict.get("company", ""),
-    ]).lower()
-
-    matches = sum(1 for t in niche_tokens if t in searchable)
-    return min(matches, 5)
-
-
-def rank_active_companies(active_companies: list, target_niche: str = "") -> list:
+def rank_active_companies(
+    active_companies: list,
+    target_niche: str = "",
+    weights: dict = None,
+) -> list:
     """
     Score and rank all active companies for a lead.
     Returns the list sorted best-first with a 'score' key added to each dict.
 
-    Scoring weights:
+    Default scoring weights (overridable via pipeline_config.json icp.scoring_weights):
       title_score  * 3  — operational control
       tenure_score * 2  — long tenure = likely main business
       size_score   * 2  — small = likely founder-led
@@ -603,6 +737,9 @@ def rank_active_companies(active_companies: list, target_niche: str = "") -> lis
       has_website  + 1  — basic viability signal
       has_desc     + 1  — more established
     """
+    _DEFAULT_WEIGHTS = {"title": 3, "tenure": 2, "size": 2, "niche": 1}
+    w = {**_DEFAULT_WEIGHTS, **(weights or {})}
+
     scored = []
 
     for company in active_companies:
@@ -631,11 +768,11 @@ def rank_active_companies(active_companies: list, target_niche: str = "") -> lis
         has_desc    = 1 if company.get("company_description") else 0
 
         total = (
-            title_score  * 3 +
-            tenure_score * 2 +
-            size_score   * 2 +
-            niche_score  * 1 +
-            has_website      +
+            title_score  * w["title"]  +
+            tenure_score * w["tenure"] +
+            size_score   * w["size"]   +
+            niche_score  * w["niche"]  +
+            has_website                +
             has_desc
         )
 
@@ -656,38 +793,6 @@ def rank_active_companies(active_companies: list, target_niche: str = "") -> lis
     return scored
 
 
-# kept for backwards compat — delegates to score_niche_fit
-def score_company_for_niche(company_dict: dict, target_niche: str) -> int:
-    return score_niche_fit(company_dict, target_niche)
-
-
-# ---------------------------------------------------------------------------
-# Company size helpers
-# ---------------------------------------------------------------------------
-
-def parse_company_size(size_string: str) -> "int | None":
-    if not size_string:
-        return None
-    s = size_string.lower().strip()
-
-    # Solo operators
-    if any(word in s for word in ["myself", "self-employed", "freelance"]):
-        return 1
-
-    # Strip commas and plus signs, find all numbers
-    s_clean = s.replace(",", "").replace("+", "")
-    numbers = re.findall(r"\d+", s_clean)
-    if not numbers:
-        return None
-
-    nums = [int(n) for n in numbers]
-
-    # Range like "11-50" → return upper bound
-    if len(nums) >= 2:
-        return max(nums)
-
-    # Single number
-    return nums[0]
 
 
 # ---------------------------------------------------------------------------
@@ -767,27 +872,50 @@ def process_leads(
     limit: int = None,
     target_niche: str = "",
     input_file_name: str = "",
+    config: dict = None,
 ) -> "tuple[list, dict]":
     """
     Run YouTube qualification for every row.
     Returns (results, summary) where results is a list of result dicts and
     summary is a dict suitable for write_session_summary().
     """
+    if config is None:
+        config = load_pipeline_config()
+
+    # Resolve target_niche: explicit arg > config icp > env var
+    icp_cfg = config.get("icp", {})
+    resolved_niche = target_niche or icp_cfg.get("target_niche", "") or os.getenv("TARGET_NICHE", "")
+    scoring_weights = icp_cfg.get("scoring_weights") or None
+
+    input_cfg = config.get("input", {})
+    column_map = input_cfg.get("column_map", {})
+    suffixes   = input_cfg.get("multi_company_suffixes", ["", " (2)", " (3)", " (4)"])
+
+    youtube_cfg = config.get("youtube", {})
+    skip_youtube_if_no_email  = youtube_cfg.get("skip_if_no_email", False)
+    max_companies_per_lead    = youtube_cfg.get("max_companies_per_lead")
+
+    offer_cfg      = config.get("offer_classifier", {})
+    offer_discard_on = set(offer_cfg.get("discard_on", ["B2C", "LOW_TICKET", "NO_WEBSITE"]))
+    offer_flag_on    = set(offer_cfg.get("flag_only",  ["FETCH_FAILED", "UNCLEAR"]))
+
     start_time = time.time()
     results = []
     total = len(rows)
 
     skipped = 0
-    prescreen_count = 0
-    size_discard_count = 0
+    filter_discard_counts: dict = {}
     offer_discard_count = 0
+
     for i, row in enumerate(rows, 1):
-        profile = _normalize_row(row)
+        remapped = remap_row(row, column_map)
+        profile  = _normalize_row(remapped, suffixes=suffixes)
 
         # --- Multi-company: rank and reassign primary ---
         ranked = rank_active_companies(
             profile.get("active_companies", []),
-            target_niche=target_niche,
+            target_niche=resolved_niche,
+            weights=scoring_weights,
         )
         if ranked:
             primary = ranked[0]
@@ -825,20 +953,24 @@ def process_leads(
             skipped += 1
             continue
 
-        prescreen, prescreen_reason = should_prescreen_discard(profile)
-        if prescreen:
-            print(f"[{i}/{total}] DISCARD_PRESCREEN ({prescreen_reason}) — {person} / {company}", file=sys.stderr)
+        # --- Configurable pre-offer filter pipeline ---
+        filter_result = apply_filters(profile, config)
+        if filter_result.discard:
+            print(f"[{i}/{total}] {filter_result.condition} ({filter_result.reason}) — {person} / {company}",
+                  file=sys.stderr)
             results.append({
                 **profile,
-                "error": prescreen_reason,
-                "yt_condition": "DISCARD_PRESCREEN",
+                "error": filter_result.reason,
+                "yt_condition": filter_result.condition,
                 "yt_channel_url": None,
                 "yt_channel_name": None,
                 "yt_last_upload": None,
                 "why_chosen": "",
                 "confidence": "",
             })
-            prescreen_count += 1
+            filter_discard_counts[filter_result.condition] = (
+                filter_discard_counts.get(filter_result.condition, 0) + 1
+            )
             continue
 
         if limit and len(results) >= limit:
@@ -848,7 +980,7 @@ def process_leads(
         if not person or not company:
             msg = (
                 f"[{i}/{total}] SKIP — missing person or company (row keys: "
-                f"{list(row.keys())[:5]})"
+                f"{list(remapped.keys())[:5]})"
             )
             print(msg, file=sys.stderr)
             results.append(
@@ -865,26 +997,14 @@ def process_leads(
             )
             continue
 
-        size_int = parse_company_size(profile["company_size"])
-        if size_int is not None and size_int > 50:
-            print(f"[{i}/{total}] DISCARD_SIZE ({profile['company_size']}) — {person} / {company}", file=sys.stderr)
-            results.append({
-                **profile,
-                "error": f"Company too large: {profile['company_size']}",
-                "yt_condition": "DISCARD_SIZE",
-                "yt_channel_url": None,
-                "yt_channel_name": None,
-                "yt_last_upload": None,
-                "why_chosen": "",
-                "confidence": "",
-            })
-            size_discard_count += 1
-            continue
-
-        offer_class, offer_reason = classify_website_offer(profile.get("website"))
+        # --- Offer classifier (discard list driven by config) ---
+        offer_class, offer_reason, offer_text = classify_website_offer(profile.get("website"))
         profile["offer_classification"] = offer_class
-        if offer_class in ("B2C", "LOW_TICKET", "NO_WEBSITE"):
-            print(f"[{i}/{total}] DISCARD_OFFER ({offer_class}: {offer_reason}) — {person} / {company}", file=sys.stderr)
+        profile["_offer_reason"] = offer_reason
+        profile["_social_proof"] = _detect_social_proof(offer_text) if offer_text else None
+        if offer_class in offer_discard_on:
+            print(f"[{i}/{total}] DISCARD_OFFER ({offer_class}: {offer_reason}) — {person} / {company}",
+                  file=sys.stderr)
             results.append({
                 **profile,
                 "error": f"{offer_class}: {offer_reason}",
@@ -897,10 +1017,32 @@ def process_leads(
             })
             offer_discard_count += 1
             continue
-        elif offer_class in ("FETCH_FAILED", "UNCLEAR"):
+        elif offer_class in offer_flag_on:
             profile["_offer_flag"] = offer_class
 
+        # --- Skip YouTube if no email (saves quota) ---
+        if skip_youtube_if_no_email:
+            email = profile.get("email", "")
+            if not email or email.lower() in ("not found", "none", ""):
+                print(f"[{i}/{total}] SKIP_YOUTUBE (no email) — {person} / {company}", file=sys.stderr)
+                results.append({
+                    **profile,
+                    "error": "Skipped YouTube: no email (youtube.skip_if_no_email=true)",
+                    "yt_condition": "SKIP_NO_EMAIL",
+                    "yt_channel_url": None,
+                    "yt_channel_name": None,
+                    "yt_last_upload": None,
+                    "why_chosen": "",
+                    "confidence": "",
+                })
+                continue
+
         print(f"[{i}/{total}] {person} / {company}", file=sys.stderr)
+
+        # Cap companies per lead to save quota
+        active_for_yt = profile.get("active_companies", [])
+        if max_companies_per_lead:
+            active_for_yt = active_for_yt[:max_companies_per_lead]
 
         try:
             yt = qualify_youtube(
@@ -908,7 +1050,7 @@ def process_leads(
                 company_name=profile["company"],
                 website_url=profile.get("website"),
                 no_claude=no_claude,
-                active_companies=profile.get("active_companies", []),
+                active_companies=active_for_yt,
             )
         except Exception as exc:
             print(f"  ERROR for {person} / {company}: {exc}", file=sys.stderr)
@@ -934,6 +1076,11 @@ def process_leads(
         condition = yt.get("condition", "?")
         print(f"  → {condition}: {yt.get('reasoning', '')[:80]}", file=sys.stderr)
 
+        rev_confidence, rev_score, rev_breakdown = estimate_revenue_confidence(
+            profile,
+            social_proof=profile.get("_social_proof"),
+        )
+
         results.append(
             {
                 **profile,
@@ -946,25 +1093,31 @@ def process_leads(
                 "yt_secondary_channels": yt.get("secondary_channels", ""),
                 "why_chosen":            "",
                 "confidence":            "",
+                "revenue_confidence":    rev_confidence,
+                "revenue_score":         rev_score,
+                "revenue_score_detail":  rev_breakdown,
                 "_yt_videos":            yt.get("videos"),
                 "_yt_reasoning":         yt.get("reasoning", ""),
                 "_all_company_results":  yt.get("all_company_results", []),
             }
         )
 
-    if skipped:
-        print(f"Skipped {skipped} already-qualified lead(s).", file=sys.stderr)
-    if prescreen_count:
-        print(f"Discarded {prescreen_count} lead(s) — Sales Nav filter mismatch.", file=sys.stderr)
-    if size_discard_count:
-        print(f"Discarded {size_discard_count} lead(s) — company too large (>50 employees).", file=sys.stderr)
-    if offer_discard_count:
-        print(f"Discarded {offer_discard_count} lead(s) — website offer not high-ticket B2B.", file=sys.stderr)
-
     condition_counts: dict = {}
     for r in results:
         c = r.get("yt_condition", "")
         condition_counts[c] = condition_counts.get(c, 0) + 1
+
+    # Derived counts for backward-compat summary keys
+    prescreen_count   = filter_discard_counts.get("DISCARD_PRESCREEN", 0)
+    size_discard_count = filter_discard_counts.get("DISCARD_SIZE", 0)
+    total_filter_discards = sum(filter_discard_counts.values())
+
+    if skipped:
+        print(f"Skipped {skipped} already-qualified lead(s).", file=sys.stderr)
+    for condition, count in sorted(filter_discard_counts.items()):
+        print(f"Discarded {count} lead(s) — {condition}.", file=sys.stderr)
+    if offer_discard_count:
+        print(f"Discarded {offer_discard_count} lead(s) — website offer not high-ticket B2B.", file=sys.stderr)
 
     elapsed = round(time.time() - start_time, 1)
 
@@ -976,6 +1129,7 @@ def process_leads(
         "skipped_dedup":       skipped,
         "discarded_prescreen": prescreen_count,
         "discarded_size":      size_discard_count,
+        "discarded_filters":   total_filter_discards,
         "discarded_offer":     offer_discard_count,
         "youtube_errors":      condition_counts.get("ERROR", 0),
         "condition_a":         condition_counts.get("A", 0),
@@ -1070,6 +1224,8 @@ def _build_lead_row(r: dict) -> list:
         json.dumps(r.get("primary_score_detail", {})) if r.get("primary_score_detail") else "",
         r.get("yt_resolution_rule", ""),
         r.get("yt_secondary_channels", ""),
+        r.get("revenue_confidence", ""),
+        r.get("revenue_score", ""),
     ]
 
 
@@ -1107,12 +1263,16 @@ def write_to_sheet(results: list, sheet_id: str, tab_name: str = None) -> str:
     """
     session = _get_session()
 
-    _DISCARD_CONDITIONS = {"DISCARD_SIZE", "DISCARD_PRESCREEN", "DISCARD_OFFER", "DISCARD"}
-    _ERROR_CONDITIONS   = {"ERROR"}
-    _QUALIFIED_EXCLUDE  = _DISCARD_CONDITIONS | _ERROR_CONDITIONS | {"STAGE2_NEEDED"}
+    _ERROR_CONDITIONS = {"ERROR"}
+    _SKIP_CONDITIONS  = {"STAGE2_NEEDED", "SKIP_NO_EMAIL"}
 
-    qualified = [r for r in results if r.get("yt_condition") not in _QUALIFIED_EXCLUDE]
-    discards  = [r for r in results if r.get("yt_condition") in _DISCARD_CONDITIONS]
+    def _is_discard(cond: str) -> bool:
+        return str(cond).startswith("DISCARD_")
+
+    qualified = [r for r in results
+                 if not _is_discard(r.get("yt_condition", ""))
+                 and r.get("yt_condition") not in _ERROR_CONDITIONS | _SKIP_CONDITIONS]
+    discards  = [r for r in results if _is_discard(r.get("yt_condition", ""))]
     errors    = [r for r in results if r.get("yt_condition") in _ERROR_CONDITIONS]
 
     leads_tab    = tab_name or f"Leads {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
@@ -1192,9 +1352,21 @@ def main():
         metavar="N",
         help="Only process the first N leads (after dedup skips)",
     )
+    parser.add_argument(
+        "--config",
+        metavar="FILE",
+        help="Path to pipeline_config.json (default: pipeline_config.json in project root)",
+    )
 
     args = parser.parse_args()
     sheet_id = _extract_sheet_id(args.output_sheet)
+
+    # Load pipeline config (custom path or default location)
+    import pipeline_filters as _pf
+    if args.config:
+        _pf._CONFIG_PATH = os.path.abspath(args.config)
+    config = load_pipeline_config()
+    print(f"Config loaded from: {_pf._CONFIG_PATH}", file=sys.stderr)
 
     # --- Write mode ---
     if args.write_results:
@@ -1233,6 +1405,7 @@ def main():
         already_done=already_done,
         limit=args.limit,
         input_file_name=os.path.basename(args.input),
+        config=config,
     )
 
     if not results:
