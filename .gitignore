@@ -8,12 +8,15 @@ __pycache__/
 .venv/
 venv/
 
+# Input lead lists (may contain personal data — never commit)
+Input_lists/*
+
 # Secrets
 .env
-*.json
-!youtube_qualifier/requirements.txt
+leads-service-account.json
+session_counter.json
 
 # Temp files
 .tmp/
 /tmp/
-leads-service-account.json
+

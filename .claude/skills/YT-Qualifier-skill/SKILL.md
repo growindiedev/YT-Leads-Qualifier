@@ -26,7 +26,7 @@ Parse $ARGUMENTS: first = number of new leads to process (optional, omit or pass
 Resolve input and output as follows:
 
 1. **Limit** — use first argument if it's a number. If omitted or empty, process all new leads.
-2. **Input** — use second argument if provided, else read `INPUT_SHEET_ID` from `.env`. If also empty, find the `.csv` file in the project root.
+2. **Input** — use second argument if provided, else read `INPUT_SHEET_ID` from `.env`. If also empty, find the `.csv` file in the `Input_lists/` folder.
 3. **Output sheet** — use third argument if provided, else read `OUTPUT_SHEET_ID` from `.env`.
 
 If no input can be resolved, stop and tell the user.

@@ -104,7 +104,7 @@ https://docs.google.com/spreadsheets/d/THIS_IS_THE_SHEET_ID/edit
 
 ### Recommended: use the skill inside Claude Code
 
-Drop a CSV in the project root, then run the skill:
+Drop a CSV in the `Input_lists/` folder (gitignored — safe for personal data), then run the skill:
 
 ```
 /qualify-leads                          # process all new leads using .env defaults
