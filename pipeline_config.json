@@ -136,9 +136,10 @@
   },
 
   "youtube": {
-    "_comment": "YouTube API behaviour controls.",
+    "_comment": "YouTube API behaviour controls. person_name_search: when false, skips Stage 3 (search by person name) and Stage 4 (combined search) — only website scrape and company name search are used. This prevents false matches on common names.",
     "skip_if_no_email": false,
-    "max_companies_per_lead": null
+    "max_companies_per_lead": null,
+    "person_name_search": false
   },
 
   "icp": {

@@ -899,6 +899,7 @@ def process_leads(
     youtube_cfg = config.get("youtube", {})
     skip_youtube_if_no_email  = youtube_cfg.get("skip_if_no_email", False)
     max_companies_per_lead    = youtube_cfg.get("max_companies_per_lead")
+    person_name_search        = youtube_cfg.get("person_name_search", True)
 
     offer_cfg      = config.get("offer_classifier", {})
     offer_discard_on = set(offer_cfg.get("discard_on", ["B2C", "LOW_TICKET", "NO_WEBSITE"]))
@@ -1056,6 +1057,7 @@ def process_leads(
                 website_url=profile.get("website"),
                 no_claude=no_claude,
                 active_companies=active_for_yt,
+                person_name_search=person_name_search,
             )
         except Exception as exc:
             print(f"  ERROR for {person} / {company}: {exc}", file=sys.stderr)

@@ -433,6 +433,7 @@ def discover_channel_for_company(
     company_dict: dict,
     person_name: str,
     api_key: str = "",  # reserved for future per-request key support; module uses global client
+    person_name_search: bool = True,
 ) -> dict | None:
     """
     Attempt to find a YouTube channel for one specific company.
@@ -444,8 +445,8 @@ def discover_channel_for_company(
     Discovery order:
         Stage 1 — Scrape company website (free)
         Stage 2 — YouTube search by company name + cross-validate
-        Stage 3 — YouTube search by person name + cross-validate
-        Stage 4 — YouTube search combined (person + company) — no cross-validation
+        Stage 3 — YouTube search by person name + cross-validate (skipped if person_name_search=False)
+        Stage 4 — YouTube search combined (person + company) — no cross-validation (skipped if person_name_search=False)
     """
     company_name    = company_dict.get("company", "")
     company_website = company_dict.get("company_website") or ""
@@ -475,6 +476,9 @@ def discover_channel_for_company(
         )
         if candidate:
             return {**candidate, "source": "search_company", "confidence": "high"}
+
+    if not person_name_search:
+        return None
 
     time.sleep(0.3)
 
@@ -738,6 +742,7 @@ def qualify_all_companies(
     active_companies: list,
     person_name: str,
     no_claude: bool = False,
+    person_name_search: bool = True,
 ) -> list:
     """
     Run YouTube discovery and qualification for each active company.
@@ -757,6 +762,7 @@ def qualify_all_companies(
             discovery = discover_channel_for_company(
                 company_dict=company,
                 person_name=person_name,
+                person_name_search=person_name_search,
             )
         except HttpError as e:
             if e.resp.status == 403:
@@ -965,6 +971,7 @@ def qualify_youtube(
     website_url: str = None,
     no_claude: bool = False,
     active_companies: list = None,
+    person_name_search: bool = True,
 ) -> dict:
     """
     Qualify YouTube presence for a lead.
@@ -987,6 +994,7 @@ def qualify_youtube(
             active_companies=companies,
             person_name=person_name,
             no_claude=no_claude,
+            person_name_search=person_name_search,
         )
     except HttpError as e:
         if e.resp.status == 403:
