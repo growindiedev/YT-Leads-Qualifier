@@ -1,6 +1,17 @@
 {
   "_comment": "ContentScale pipeline filter configuration. All filters default to their original hardcoded behaviour — set 'enabled: true' to activate new ones.",
 
+  "batch": {
+    "_comment": "Batch processing defaults. default_limit applies when no --limit flag is given. Set to null to process all leads by default.",
+    "default_limit": 15
+  },
+
+  "website_classifier": {
+    "_comment": "Controls for the website offer classifier. fetch_timeout: seconds before a request is abandoned. page_char_limit: how many characters of page text to analyse.",
+    "fetch_timeout": 6,
+    "page_char_limit": 3500
+  },
+
   "input": {
     "_comment": "Column mapping and source settings. column_map keys are the standard pipeline names; values are the actual column names in your CSV. Leave empty to use Sales Navigator defaults.",
     "column_map": {
@@ -32,16 +43,16 @@
   "size_gate": {
     "enabled": true,
     "min_employees": 1,
-    "max_employees": 50
+    "max_employees": 100
   },
 
   "prescreen": {
     "_comment": "Sales Navigator mismatched-filter rules. Only applies when source_type is 'sales_navigator'.",
     "enabled": true,
     "rules": {
-      "primary_employee_count_mismatch":        true,
-      "all_companies_employee_count_mismatch":  true,
-      "matching_filters_false":                 true
+      "primary_employee_count_mismatch":        false,
+      "all_companies_employee_count_mismatch":  false,
+      "matching_filters_false":                 false
     }
   },
 

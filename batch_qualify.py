@@ -434,14 +434,14 @@ _FALLBACK_PATHS = ["/services", "/work-with-me", "/how-it-works",
                    "/offerings", "/coaching", "/consulting", "/about"]
 
 
-def _fetch_page_text(url: str, char_limit: int = 3500) -> "tuple[str, str] | None":
+def _fetch_page_text(url: str, char_limit: int = 3500, timeout: int = 6) -> "tuple[str, str] | None":
     """
     Fetch a URL and return (lowercased_text, base_scheme_host).
     Returns None on failure. Extracts title + meta description before stripping tags.
     """
     from urllib.parse import urlparse
     try:
-        resp = requests.get(url, headers=_WEBSITE_CLASSIFIER_HEADERS, timeout=6)
+        resp = requests.get(url, headers=_WEBSITE_CLASSIFIER_HEADERS, timeout=timeout)
         if resp.status_code != 200:
             return None
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -560,12 +560,17 @@ def _detect_social_proof(text: str) -> dict:
 
 def classify_website_offer(
     url: "str | None",
+    config: "dict | None" = None,
 ) -> "tuple[str, str, str]":
     """
     Returns (classification, reason, combined_text) where combined_text
     is the homepage + social-proof page text for use with _detect_social_proof.
     combined_text is "" on fetch failure.
     """
+    wc_cfg = (config or {}).get("website_classifier", {})
+    fetch_timeout = wc_cfg.get("fetch_timeout", 6)
+    page_char_limit = wc_cfg.get("page_char_limit", 3500)
+
     if not url:
         return ("NO_WEBSITE", "No website URL available", "")
 
@@ -573,7 +578,7 @@ def classify_website_offer(
         url = "https://" + url
 
     try:
-        result = _fetch_page_text(url)
+        result = _fetch_page_text(url, char_limit=page_char_limit, timeout=fetch_timeout)
     except requests.Timeout:
         return ("FETCH_FAILED", "Request timed out", "")
     except Exception as e:
@@ -588,7 +593,7 @@ def classify_website_offer(
     if classification == "UNCLEAR":
         # Try each fallback page in order; stop at first non-UNCLEAR result
         for path in _FALLBACK_PATHS:
-            fallback = _fetch_page_text(base + path, char_limit=2000)
+            fallback = _fetch_page_text(base + path, char_limit=2000, timeout=fetch_timeout)
             if fallback is None:
                 continue
             fb_text, _ = fallback
@@ -599,7 +604,7 @@ def classify_website_offer(
     # Try to find a social proof page and append its text
     social_text = ""
     for sp_path in SOCIAL_PROOF_PAGES:
-        sp_result = _fetch_page_text(base + sp_path, char_limit=2000)
+        sp_result = _fetch_page_text(base + sp_path, char_limit=2000, timeout=fetch_timeout)
         if sp_result is not None:
             social_text = sp_result[0]
             break
@@ -998,7 +1003,7 @@ def process_leads(
             continue
 
         # --- Offer classifier (discard list driven by config) ---
-        offer_class, offer_reason, offer_text = classify_website_offer(profile.get("website"))
+        offer_class, offer_reason, offer_text = classify_website_offer(profile.get("website"), config)
         profile["offer_classification"] = offer_class
         profile["_offer_reason"] = offer_reason
         profile["_social_proof"] = _detect_social_proof(offer_text) if offer_text else None

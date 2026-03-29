@@ -48,6 +48,8 @@ _PASS = FilterResult(discard=False, condition="", reason="")
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline_config.json")
 
 _DEFAULTS: dict = {
+    "batch":               {"default_limit": 15},
+    "website_classifier":  {"fetch_timeout": 6, "page_char_limit": 3500},
     "input": {
         "column_map": {},
         "multi_company_suffixes": ["", " (2)", " (3)", " (4)"],

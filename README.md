@@ -10,7 +10,7 @@
 3. [Running the pipeline](#3-running-the-pipeline)
 4. [Understanding the output](#4-understanding-the-output)
 5. [YouTube conditions reference](#5-youtube-conditions-reference)
-6. [Configuration manual — `pipeline_config.json`](#6-configuration-manual)
+6. [Configuration manual — `pipeline_config.json`](#6-configuration-manual) · [`batch`](#batch--batch-processing-defaults) · [`website_classifier`](#website_classifier--website-fetch-settings) · [`input`](#input--column-mapping-and-source-settings) · [`size_gate`](#size_gate--filter-by-employee-count) · [`prescreen`](#prescreen--sales-navigator-filter-mismatch-rules) · and more
 7. [Using non-Sales-Navigator CSV files](#7-using-non-sales-navigator-csv-files)
 8. [Multi-company leads](#8-multi-company-leads)
 9. [YouTube quota management](#9-youtube-quota-management)
@@ -23,7 +23,7 @@
 
 Takes a CSV or Google Sheet of raw B2B leads and qualifies each one for outreach from ContentScale.
 
-**The ideal lead:** a founder or senior executive running a small B2B service business (1–50 employees) with little or no YouTube presence — someone who would benefit from content-led growth but isn't already doing it well.
+**The ideal lead:** a founder or senior executive running a small B2B service business (1–100 employees) with little or no YouTube presence — someone who would benefit from content-led growth but isn't already doing it well.
 
 **Qualification gates (in order):**
 
@@ -31,7 +31,7 @@ Takes a CSV or Google Sheet of raw B2B leads and qualifies each one for outreach
 |------|-------------|
 | Dedup | Skips leads already written to the output sheet |
 | Prescreen | Discards Sales Navigator leads that failed the search filters |
-| Size gate | Discards companies with more than 50 employees |
+| Size gate | Discards companies outside the configured employee range (default: 1–100) |
 | Multi-company scoring | When a person has multiple active roles, selects the most relevant one as the primary company |
 | Website classifier | Fetches the company website; discards B2C, low-ticket, or missing websites |
 | YouTube analysis | Checks for YouTube presence per company; Stage 1 is deterministic; Stage 2 needs human judgment |
@@ -107,8 +107,9 @@ https://docs.google.com/spreadsheets/d/THIS_IS_THE_SHEET_ID/edit
 Drop a CSV in the `Input_lists/` folder (gitignored — safe for personal data), then run the skill:
 
 ```
-/qualify-leads                          # process all new leads using .env defaults
+/qualify-leads                          # process up to batch.default_limit new leads (default: 15)
 /qualify-leads 25                       # process first 25 new leads
+/qualify-leads 0                        # process ALL new leads (no limit)
 /qualify-leads 10 "leads.csv" "SHEET_ID"  # explicit input and output
 ```
 
@@ -218,7 +219,7 @@ Each run creates or appends to these tabs in the output sheet:
 |-----------|---------|
 | `FAIL` | Active, polished channel — already doing content well |
 | `DISCARD_PRESCREEN` | Sales Nav filter mismatch (company too large or didn't match search) |
-| `DISCARD_SIZE` | Company has more than 50 employees |
+| `DISCARD_SIZE` | Company is outside the configured employee range |
 | `DISCARD_OFFER` | Website classified as B2C, low-ticket, or no website found |
 
 ### Internal conditions (not written to sheet)
@@ -236,6 +237,40 @@ Each run creates or appends to these tabs in the output sheet:
 All pipeline behaviour is controlled by `pipeline_config.json` in the project root. You can also pass `--config path/to/file.json` on the CLI to use a different file.
 
 Every filter section has an `"enabled"` field. **Setting `"enabled": false` completely skips that filter.** New filters default to `false` — existing behaviour is unchanged until you opt in.
+
+---
+
+### `batch` — Batch processing defaults
+
+Controls default behaviour when running the pipeline without explicit CLI arguments.
+
+```json
+"batch": {
+  "default_limit": 15
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `default_limit` | How many new leads to process when no `--limit` flag is given (and no limit is passed to `/qualify-leads`). Set to `null` to process all leads by default. |
+
+---
+
+### `website_classifier` — Website fetch settings
+
+Controls how the offer classifier fetches and reads company websites.
+
+```json
+"website_classifier": {
+  "fetch_timeout": 6,
+  "page_char_limit": 3500
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `fetch_timeout` | Seconds to wait for a website response before giving up with `FETCH_FAILED`. Increase if you're seeing many timeouts on slow sites. |
+| `page_char_limit` | How many characters of page body text to analyse. Higher values are more thorough but slower. |
 
 ---
 
@@ -281,7 +316,7 @@ Discards companies outside the min/max employee range.
 "size_gate": {
   "enabled": true,
   "min_employees": 1,
-  "max_employees": 50
+  "max_employees": 100
 }
 ```
 
@@ -300,18 +335,20 @@ Discards leads whose Sales Navigator `mismatched filters` column signals the pri
 "prescreen": {
   "enabled": true,
   "rules": {
-    "primary_employee_count_mismatch": true,
-    "all_companies_employee_count_mismatch": true,
-    "matching_filters_false": true
+    "primary_employee_count_mismatch": false,
+    "all_companies_employee_count_mismatch": false,
+    "matching_filters_false": false
   }
 }
 ```
 
-| Rule | When it discards |
-|------|-----------------|
-| `primary_employee_count_mismatch` | The primary company's LinkedIn employee count doesn't match your Sales Nav search filter |
-| `all_companies_employee_count_mismatch` | Every company on the profile has a mismatched employee count |
-| `matching_filters_false` | The `matching filters` column is `"false"` |
+| Rule | When it discards | Default |
+|------|-----------------|---------|
+| `primary_employee_count_mismatch` | The primary company's LinkedIn employee count doesn't match your Sales Nav search filter | `false` |
+| `all_companies_employee_count_mismatch` | Every company on the profile has a mismatched employee count | `false` |
+| `matching_filters_false` | The `matching filters` column is `"false"` | `false` |
+
+The employee count rules are off by default because Sales Nav's internal index can lag behind what's exported in the CSV — the `size_gate` handles employee count filtering with the actual data. Enable `matching_filters_false` if you want to drop leads Sales Nav itself flagged as not matching your search.
 
 Turn off individual rules by setting them to `false`. Setting `"enabled": false` disables all prescreen checks.
 
@@ -766,9 +803,9 @@ The dedup check reads the `Full Name` + `Company` combination from all existing 
 
 ### Prescreen discarding too many (or too few) leads
 
-Review the individual rules under `prescreen.rules`:
-- `matching_filters_false` is the broadest rule — disable it if you want to include leads where Sales Nav flagged filter mismatches
-- `primary_employee_count_mismatch` discards leads where the primary company is outside your size filter — useful but can be aggressive
+Review the individual rules under `prescreen.rules`. All rules are **off by default**:
+- `primary_employee_count_mismatch` and `all_companies_employee_count_mismatch` are disabled because Sales Nav's internal employee count often lags the exported data — the `size_gate` handles this more reliably
+- `matching_filters_false` is the strongest signal (Sales Nav itself flagged the lead as not matching) — enable it if you want strict adherence to your search criteria
 
 ### Website classifier discarding good leads as `FETCH_FAILED`
 
