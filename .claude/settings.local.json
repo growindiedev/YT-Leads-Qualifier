@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Users/jarryingnut/Documents/Projects/Coding_projects/Leads_Qualification -name *.csv)",
+      "Read(//Users/jarryingnut/Downloads/**)",
+      "Bash(python3 -c \"import venv; print\\(''venv ok''\\)\")",
+      "Bash(ls /Users/jarryingnut/Documents/Projects/Coding_projects/Leads_Qualification/*.csv)",
+      "Bash(.venv/bin/python batch_qualify.py --test-size)",
+      "Bash(.venv/bin/python youtube_qualifier.py --test-name-match)",
+      "Bash(.venv/bin/python -c \"import batch_qualify; print\\(''''OK''''\\)\")",
+      "Bash(.venv/bin/python test_cases.py)",
+      "Bash(*)"
+    ]
+  }
+}

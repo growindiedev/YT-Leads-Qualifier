@@ -1,0 +1,150 @@
+{
+  "_comment": "ContentScale pipeline filter configuration. All filters default to their original hardcoded behaviour — set 'enabled: true' to activate new ones.",
+
+  "input": {
+    "_comment": "Column mapping and source settings. column_map keys are the standard pipeline names; values are the actual column names in your CSV. Leave empty to use Sales Navigator defaults.",
+    "column_map": {
+      "first name":                        "first name",
+      "last name":                         "last name",
+      "linkedin url":                      "linkedin url",
+      "email":                             "email address",
+      "location":                          "location",
+      "job title":                         "job title",
+      "company":                           "company",
+      "corporate website":                 "corporate website",
+      "corporate linkedin url":            "corporate linkedin url",
+      "linkedin employees":                "linkedin employees",
+      "linkedin company employee count":   "linkedin company employee count",
+      "linkedin description":              "linkedin description",
+      "linkedin specialities":             "linkedin specialities",
+      "linkedin industry":                 "linkedin industry",
+      "company revenue":                   "company revenue",
+      "job started on":                    "job started on",
+      "job ended on":                      "job ended on",
+      "mismatched filters":                "mismatched filters",
+      "matching filters":                  "matching filters",
+      "last linkedin activity":            "last linkedin activity"
+    },
+    "multi_company_suffixes": ["", " (2)", " (3)", " (4)"],
+    "source_type": "sales_navigator"
+  },
+
+  "size_gate": {
+    "enabled": true,
+    "min_employees": 1,
+    "max_employees": 50
+  },
+
+  "prescreen": {
+    "_comment": "Sales Navigator mismatched-filter rules. Only applies when source_type is 'sales_navigator'.",
+    "enabled": true,
+    "rules": {
+      "primary_employee_count_mismatch":        true,
+      "all_companies_employee_count_mismatch":  true,
+      "matching_filters_false":                 true
+    }
+  },
+
+  "title_filter": {
+    "_comment": "Substring match on job_title (case-insensitive). require_any: must match at least one. exclude_any: discard if any match.",
+    "enabled": false,
+    "require_any": ["founder", "owner", "ceo", "cmo", "president", "partner", "principal", "director"],
+    "exclude_any": ["intern", "coordinator", "assistant", "associate", "specialist"]
+  },
+
+  "location_filter": {
+    "_comment": "Substring match on location field. mode 'include' keeps only listed locations; mode 'exclude' drops them.",
+    "enabled": false,
+    "mode": "include",
+    "values": ["United States", "Canada", "United Kingdom", "Australia", "New Zealand"]
+  },
+
+  "industry_filter": {
+    "_comment": "Substring match on LinkedIn company industry. mode 'include' keeps only listed industries; mode 'exclude' drops them.",
+    "enabled": false,
+    "mode": "exclude",
+    "values": [
+      "Higher Education",
+      "Government Administration",
+      "Non-profit Organizations",
+      "Religious Institutions"
+    ]
+  },
+
+  "keyword_filter": {
+    "_comment": "Keyword scan across selected company profile fields. fields options: company_description, company_specialities, summary, headline.",
+    "enabled": false,
+    "fields": ["company_description", "company_specialities"],
+    "require_any": [],
+    "exclude_any": ["mlm", "dropshipping", "crypto", "nft", "pyramid", "network marketing"]
+  },
+
+  "revenue_filter": {
+    "_comment": "Filter by LinkedIn revenue range. Values in USD integers (e.g. 500000 = $500K). null disables the bound.",
+    "enabled": false,
+    "min_usd": null,
+    "max_usd": null
+  },
+
+  "tenure_filter": {
+    "_comment": "Minimum months the lead must have been at their primary company.",
+    "enabled": false,
+    "min_months_at_primary": 6
+  },
+
+  "primary_score_filter": {
+    "_comment": "Filter by multi-company scoring. min_score: absolute floor. min_score_margin: primary must beat second-best by this many points.",
+    "enabled": false,
+    "min_score": 10,
+    "min_score_margin": 0
+  },
+
+  "multi_company_filter": {
+    "_comment": "Controls for leads with multiple active roles.",
+    "enabled": false,
+    "max_active_roles": null
+  },
+
+  "contact_filter": {
+    "_comment": "Hard requirements on contact info. These are standalone booleans, not grouped under 'enabled'.",
+    "require_email": false,
+    "require_linkedin": false
+  },
+
+  "activity_filter": {
+    "_comment": "Discard leads who haven't been active on LinkedIn in the last N days. Requires 'last linkedin activity' column.",
+    "enabled": false,
+    "max_days_since_activity": 180
+  },
+
+  "offer_classifier": {
+    "_comment": "Controls which offer classifications cause a discard vs a flag. Add/remove from discard_on to change behaviour.",
+    "enabled": true,
+    "discard_on": ["B2C", "LOW_TICKET", "NO_WEBSITE"],
+    "flag_only": ["FETCH_FAILED", "UNCLEAR"]
+  },
+
+  "youtube": {
+    "_comment": "YouTube API behaviour controls.",
+    "skip_if_no_email": false,
+    "max_companies_per_lead": null
+  },
+
+  "icp": {
+    "_comment": "ICP definition used in multi-company scoring. target_niche overrides the TARGET_NICHE env var when set. scoring_weights override the hardcoded multipliers.",
+    "target_niche": "",
+    "scoring_weights": {
+      "title":  3,
+      "tenure": 2,
+      "size":   2,
+      "niche":  1
+    }
+  },
+
+  "output": {
+    "leads_tab_prefix": "Leads",
+    "write_discards": true,
+    "write_errors": true,
+    "write_sessions": true
+  }
+}

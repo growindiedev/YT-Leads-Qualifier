@@ -184,3 +184,59 @@ Private channel, terminated account, or API error → treat as Condition A. Log 
 
 **Multiple channels for same person:**
 Pick the channel with the highest subscriber count. Note the other in reasoning. Apply conditions to the primary channel only.
+
+## Multi-Company Resolution Rules
+
+When a lead has multiple active companies, results are resolved as follows:
+
+### FAIL — Primary Company
+The primary (highest-scored) company has an active polished YouTube channel.
+Action: Discard the lead entirely. They already have what ContentScale sells
+at their main business.
+
+### REVIEW_FAIL — Secondary Company (website-confirmed)
+A secondary company was found via its website to have an active polished
+YouTube channel. The primary company passed.
+Action: Flag for manual review. The founder may have abandoned that channel
+or it may be run by someone else at the secondary company. Do not auto-discard.
+
+### REVIEW_FAIL — Secondary Company (search-found only)
+A secondary company was found via YouTube search (not website) to have an
+active polished channel. Lower confidence this is actually their channel.
+Action: Flag for manual review. Lower priority than website-confirmed REVIEW_FAIL.
+
+### All PASS — Multiple Active Roles
+All active companies have passing YouTube conditions.
+Action: Use primary company for outreach. Note secondary companies in output.
+The Why Chosen copy should reference both if the secondary company's gap is
+a stronger sales signal.
+
+### Condition Priority When Multiple Companies Pass
+If primary = B (dead channel) and secondary = A (no channel):
+→ Report condition B (from primary) in the output row
+→ Note secondary in "Secondary Channels" column
+
+The output condition always reflects the PRIMARY company's YouTube status.
+Secondary company results are stored in `_all_company_results` for reference.
+
+---
+
+## Score Detail Reference
+
+The `score_detail` JSON written to the "Score Detail" column in the Leads tab
+shows how the primary company was selected. Format:
+
+```json
+{
+  "title":   3,   // Founder/CEO/Owner weight
+  "tenure":  4,   // Months in role (0-5 normalised)
+  "size":    2,   // Company size signal
+  "niche":   2,   // Keyword overlap with target niche
+  "website": 1,   // Has website
+  "desc":    1    // Has company description
+}
+```
+
+Use this to audit cases where the wrong company was selected as primary.
+If title=0 and tenure=0, the scoring had little to work with — consider
+manually verifying which company is their main business before outreach.
