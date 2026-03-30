@@ -356,7 +356,7 @@ def _find_channel_via_ddg(
     Returns channel_id or None.
     """
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
     except ImportError:
         return None
 
@@ -381,7 +381,7 @@ def _find_channel_via_ddg(
 
     for query in queries:
         try:
-            with DDGS() as ddgs:
+            with DDGS(verify=False) as ddgs:
                 results = list(ddgs.text(query, max_results=5))
         except Exception:
             continue
@@ -532,19 +532,19 @@ def _search_and_validate(
     company_name: str,
     company_website: str,
     require_cross_validation: bool = True,
+    max_results: int = 5,
 ) -> dict | None:
     """
     Run a YouTube channel search and validate the top results.
 
     If require_cross_validation=True: candidate must pass name match AND
     (if channel has a listed website) website must match company_website.
-    If require_cross_validation=False: name match only.
 
     Returns {"channel_id": ..., "channel_url": ...} or None.
     Costs 100 quota units per call.
     """
     try:
-        results = search_youtube_channels(query, max_results=5)
+        results = search_youtube_channels(query, max_results=max_results)
     except HttpError as e:
         if e.resp.status == 403:
             raise
@@ -636,9 +636,46 @@ def discover_channel_for_company(
 
     time.sleep(0.3)
 
-    # Stage 2 — YouTube search: company name + cross-validate.
-    # For long/descriptive names also try the core brand name as a fallback
-    # (e.g. "Foloware Website design & Online lead generation" → "Foloware").
+    if not person_name_search:
+        # Skip person-based searches if caller opted out
+        if company_name:
+            core_name = _core_company_name(company_name)
+            search_names = [company_name]
+            if core_name != company_name:
+                search_names.append(core_name)
+            for qname in search_names:
+                candidate = _search_and_validate(
+                    query=qname,
+                    person_name=person_name,
+                    company_name=company_name,
+                    company_website=company_website,
+                    require_cross_validation=True,
+                )
+                if candidate:
+                    return {**candidate, "source": "search_company", "confidence": "high"}
+                time.sleep(0.3)
+        return None
+
+    # Stage 2 — YouTube search: person + company combined (most specific).
+    # User insight: the right channel almost always appears in the top 10 results
+    # for this query. Trying it first — before any single-term fallback — minimises
+    # false positives while maximising recall.
+    combined = f"{person_name} {company_name}".strip()
+    if combined:
+        candidate = _search_and_validate(
+            query=combined,
+            person_name=person_name,
+            company_name=company_name,
+            company_website=company_website,
+            require_cross_validation=True,
+            max_results=10,
+        )
+        if candidate:
+            return {**candidate, "source": "search_combined", "confidence": "high"}
+        time.sleep(0.3)
+
+    # Stage 3 — YouTube search: company name alone + cross-validate.
+    # For long/descriptive names also try the core brand name.
     if company_name:
         core_name = _core_company_name(company_name)
         search_names = [company_name]
@@ -657,12 +694,9 @@ def discover_channel_for_company(
                 return {**candidate, "source": "search_company", "confidence": "high"}
             time.sleep(0.3)
 
-    if not person_name_search:
-        return None
-
-    time.sleep(0.3)
-
-    # Stage 3 — YouTube search: person name + cross-validate
+    # Stage 4 — YouTube search: person name alone + cross-validate.
+    # Last resort — common names can produce false positives so cross-validation
+    # is required here too.
     if person_name:
         candidate = _search_and_validate(
             query=person_name,
@@ -673,21 +707,6 @@ def discover_channel_for_company(
         )
         if candidate:
             return {**candidate, "source": "search_person", "confidence": "high"}
-
-    time.sleep(0.3)
-
-    # Stage 4 — Combined search, no cross-validation required
-    combined = f"{person_name} {company_name}".strip()
-    if combined:
-        candidate = _search_and_validate(
-            query=combined,
-            person_name=person_name,
-            company_name=company_name,
-            company_website=company_website,
-            require_cross_validation=False,
-        )
-        if candidate:
-            return {**candidate, "source": "search_combined", "confidence": "low"}
 
     return None
 

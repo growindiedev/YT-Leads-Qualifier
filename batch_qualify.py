@@ -540,16 +540,16 @@ def _reclassify_unclear_via_ddg(company_name: str, website: str) -> "tuple[str, 
     Returns (classification, reason). Falls back to UNCLEAR on any failure.
     """
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
     except ImportError:
-        return ("UNCLEAR", "duckduckgo-search not installed")
+        return ("UNCLEAR", "ddgs not installed")
 
     query = company_name or website
     if not query:
         return ("UNCLEAR", "no query available")
 
     try:
-        with DDGS() as ddgs:
+        with DDGS(verify=False) as ddgs:
             results = list(ddgs.text(query, max_results=3))
     except Exception:
         return ("UNCLEAR", "DDG search failed")
@@ -575,12 +575,12 @@ def _enrich_via_clutch_ddg(company_name: str) -> dict:
     if not company_name:
         return {}
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
     except ImportError:
         return {}
 
     try:
-        with DDGS() as ddgs:
+        with DDGS(verify=False) as ddgs:
             results = list(ddgs.text(f'site:clutch.co "{company_name}"', max_results=3))
     except Exception:
         return {}
