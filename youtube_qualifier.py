@@ -114,7 +114,35 @@ STOP_WORDS = {
     "real", "true", "next", "best", "plus", "pros", "works",
     "house", "home", "zone", "core", "base", "peak", "edge",
     "open", "bold", "rise", "wave", "wire", "link", "flow",
+    # Generic service/industry descriptors
+    "design", "online", "website", "technology", "technologies",
+    "training", "coaching", "education", "learning", "development",
+    "sales", "revenue", "business", "enterprise", "professional",
 }
+
+
+def _word_in_text(word: str, text: str) -> bool:
+    """True if word appears as a whole word in text (case-insensitive, pre-lowered text)."""
+    return bool(re.search(r"\b" + re.escape(word) + r"\b", text))
+
+
+def _core_company_name(company_name: str) -> str:
+    """
+    Extract the core brand name from a long or descriptive company name.
+    Returns the first meaningful word (> 3 chars, not a stop word).
+    Falls back to the full company name if no such word is found.
+
+    Examples:
+      "Foloware Website design & Online lead generation" → "Foloware"
+      "Corridor Strategy Group"                          → "Corridor"
+      "LEVEL mpls"                                       → "LEVEL"
+      "JW Design"                                        → "JW Design"  (no long non-stop word)
+    """
+    for word in company_name.split():
+        clean = word.strip(".,&|/-").lower()
+        if len(clean) > 3 and clean not in STOP_WORDS:
+            return word.strip(".,&|/-")
+    return company_name
 
 
 def _name_match(text: str, person_name: str, company_name: str) -> bool:
@@ -129,25 +157,44 @@ def _name_match(text: str, person_name: str, company_name: str) -> bool:
     person_tokens  = meaningful_tokens(person_name, min_len=4)
     company_tokens = meaningful_tokens(company_name, min_len=4)
 
-    # Fallback: if filtering removed all tokens from a short name
-    # (e.g. "Bo Li", "Wen Ho"), relax to catch short surnames too
+    # Fallback: if filtering removed all tokens, relax min_len.
+    # Short tokens (< 4 chars) are only accepted as whole words — the
+    # previous substring check caused "jus" to match "just", etc.
     if not person_tokens:
         person_tokens = meaningful_tokens(person_name, min_len=2)
     if not company_tokens:
         company_tokens = meaningful_tokens(company_name, min_len=2)
 
-    # If we can't extract meaningful tokens, can't disqualify — let it through
+    # If we can't extract meaningful tokens from BOTH sides, reject rather
+    # than accepting anything. An empty match means we have no signal.
     if not person_tokens and not company_tokens:
-        return True
+        return False
 
-    # Person name match: ALL meaningful person tokens appear in channel text
+    # Person name match — first + last name must appear as whole words.
+    # Middle names / extra tokens are optional (handles "Michael John Smith"
+    # where the channel says "Michael Smith").
     if person_tokens:
-        if all(t in text_lower for t in person_tokens):
+        if len(person_tokens) <= 2:
+            match = all(_word_in_text(t, text_lower) for t in person_tokens)
+        else:
+            # 3+ tokens: require first and last; skip middle tokens
+            match = (
+                _word_in_text(person_tokens[0], text_lower)
+                and _word_in_text(person_tokens[-1], text_lower)
+            )
+        if match:
             return True
 
-    # Company name match: at least 2 meaningful company tokens, or 1 if only 1 exists
+    # Company name match: at least 2 meaningful tokens (or 1 if only 1 exists)
+    # must appear as whole words.
+    # Guard: if the only surviving tokens are very short (≤3 chars after
+    # fallback), require the full company name bounded by non-alphanumeric chars
+    # rather than trusting a single short token — prevents "IQ" matching "unique".
     if company_tokens:
-        matches = sum(1 for t in company_tokens if t in text_lower)
+        if all(len(t) <= 3 for t in company_tokens):
+            pattern = r"(?<![a-zA-Z0-9])" + re.escape(company_name.lower()) + r"(?![a-zA-Z0-9])"
+            return bool(re.search(pattern, text_lower))
+        matches = sum(1 for t in company_tokens if _word_in_text(t, text_lower))
         threshold = min(2, len(company_tokens))
         if matches >= threshold:
             return True
@@ -253,6 +300,126 @@ def _get_channel_subscriber_count(channel_id: str) -> "int | None":
         return None
 
 
+def _validate_channel_ownership(
+    channel_id: str,
+    person_name: str,
+    company_name: str,
+    company_website: str,
+) -> bool:
+    """
+    Confirm a YouTube channel belongs to the given person/company.
+    Calls channels.list(part="snippet") — 1 quota unit.
+    Checks channel title, description, and customUrl against person/company name.
+    Also checks if the company website domain appears in the channel description.
+    """
+    try:
+        resp = youtube.channels().list(part="snippet", id=channel_id).execute()
+        items = resp.get("items", [])
+        if not items:
+            return False
+        snippet = items[0]["snippet"]
+        text = (
+            snippet.get("title", "") + " "
+            + snippet.get("description", "") + " "
+            + snippet.get("customUrl", "")
+        )
+        if _name_match(text, person_name, company_name):
+            return True
+        if company_website:
+            from urllib.parse import urlparse
+            raw = company_website if company_website.startswith("http") else "https://" + company_website
+            domain = urlparse(raw).netloc.lstrip("www.")
+            # Use boundary anchors so "acme.com" doesn't match "myacme.com"
+            if domain:
+                pattern = r"(?<![a-zA-Z0-9\-])" + re.escape(domain) + r"(?![a-zA-Z0-9])"
+                if re.search(pattern, snippet.get("description", "").lower()):
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def _find_channel_via_ddg(
+    person_name: str,
+    company_name: str,
+    company_website: str,
+) -> "str | None":
+    """
+    Search DuckDuckGo for a YouTube channel URL, then validate ownership.
+    Free — no API key required. Costs at most 1 YouTube quota unit (channels.list
+    for validation), vs 100 units for search.list.
+
+    Tries three query variants in order, stopping at the first validated hit:
+      1. person + company — most specific
+      2. company + "youtube channel" — catches channels not mentioning the person
+      3. site:youtube.com + company — direct site search
+    Returns channel_id or None.
+    """
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        return None
+
+    core_name = _core_company_name(company_name)
+    queries = [
+        f'"{person_name}" "{company_name}" youtube',
+        f'"{company_name}" youtube channel',
+        f'site:youtube.com "{company_name}"',
+    ]
+    # For long/descriptive company names add core-brand fallbacks
+    if core_name != company_name:
+        queries += [
+            f'"{person_name}" "{core_name}" youtube',
+            f'"{core_name}" youtube channel',
+        ]
+
+    # Track both raw identifiers (handles/UC ids from URLs) and resolved channel IDs.
+    # Checking identifiers before resolution avoids repeated API calls for the same
+    # handle across different queries.
+    seen_identifiers: set = set()
+    seen_channel_ids: set = set()
+
+    for query in queries:
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=5))
+        except Exception:
+            continue
+
+        for r in results:
+            url = r.get("href", "")
+            if "youtube.com" not in url:
+                continue
+            if any(skip in url for skip in ("watch?v=", "/playlist", "/embed", "youtu.be")):
+                continue
+            identifier = find_channel_id_from_url(url)
+            if not identifier or identifier in seen_identifiers:
+                continue
+            seen_identifiers.add(identifier)
+
+            channel_id = resolve_channel_id(identifier, url)
+            if not channel_id or channel_id in seen_channel_ids:
+                continue
+            seen_channel_ids.add(channel_id)
+
+            # Skip channels too large to be a small B2B founder's channel
+            sub_count = _get_channel_subscriber_count(channel_id)
+            if sub_count is not None and sub_count > 200_000:
+                logger.info(
+                    f"  DDG: skipping channel {channel_id} "
+                    f"({sub_count:,} subs, too large)"
+                )
+                continue
+
+            if _validate_channel_ownership(channel_id, person_name, company_name, company_website):
+                logger.info(
+                    f"  DDG found channel {channel_id} for {person_name} / {company_name}"
+                )
+                return channel_id
+
+    return None
+
+
 def _get_channel_website(channel_id: str) -> str | None:
     """
     Attempt to retrieve the website URL listed on a YouTube channel's About page.
@@ -352,14 +519,8 @@ def _scrape_website_for_channel(
         except Exception:
             continue
 
-    # Validation failed. Only use fallback if exactly ONE channel link was found
-    # — a single link is almost certainly theirs. Multiple links = ambiguous.
-    if len(found_links) == 1:
-        fallback_id = _resolve_youtube_url_to_channel_id(found_links[0])
-        return fallback_id
-
     logger.info(
-        f"  Found {len(found_links)} YouTube links on {base_url} "
+        f"  Found {len(found_links)} YouTube link(s) on {base_url} "
         f"but none passed name validation. Skipping."
     )
     return None
@@ -370,7 +531,6 @@ def _search_and_validate(
     person_name: str,
     company_name: str,
     company_website: str,
-    api_key: str,
     require_cross_validation: bool = True,
 ) -> dict | None:
     """
@@ -403,10 +563,10 @@ def _search_and_validate(
             # Reject channels with >200K subscribers — established creators
             # that crowd out the real target in search results
             sub_count = _get_channel_subscriber_count(channel_id)
-            if sub_count is not None and sub_count > 200000:
+            if sub_count is not None and sub_count > 500_000:
                 logger.info(
                     f"  Skipping channel {channel_id}: "
-                    f"{sub_count:,} subscribers (too large)"
+                    f"{sub_count:,} subs (>500K threshold)"
                 )
                 continue
 
@@ -432,7 +592,6 @@ def _search_and_validate(
 def discover_channel_for_company(
     company_dict: dict,
     person_name: str,
-    api_key: str = "",  # reserved for future per-request key support; module uses global client
     person_name_search: bool = True,
 ) -> dict | None:
     """
@@ -464,18 +623,39 @@ def discover_channel_for_company(
 
     time.sleep(0.3)
 
-    # Stage 2 — YouTube search: company name + cross-validate
+    # Stage 1.5 — DDG web search (free, costs at most 1 quota unit for validation)
+    # Finds the channel URL via Google index before spending 100 units on search.list
+    channel_id = _find_channel_via_ddg(person_name, company_name, company_website)
+    if channel_id:
+        return {
+            "channel_id":  channel_id,
+            "channel_url": f"https://www.youtube.com/channel/{channel_id}",
+            "source":      "ddg_search",
+            "confidence":  "high",
+        }
+
+    time.sleep(0.3)
+
+    # Stage 2 — YouTube search: company name + cross-validate.
+    # For long/descriptive names also try the core brand name as a fallback
+    # (e.g. "Foloware Website design & Online lead generation" → "Foloware").
     if company_name:
-        candidate = _search_and_validate(
-            query=company_name,
-            person_name=person_name,
-            company_name=company_name,
-            company_website=company_website,
-            api_key=api_key,
-            require_cross_validation=True,
-        )
-        if candidate:
-            return {**candidate, "source": "search_company", "confidence": "high"}
+        core_name = _core_company_name(company_name)
+        search_names = [company_name]
+        if core_name != company_name:
+            search_names.append(core_name)
+
+        for qname in search_names:
+            candidate = _search_and_validate(
+                query=qname,
+                person_name=person_name,
+                company_name=company_name,
+                company_website=company_website,
+                require_cross_validation=True,
+            )
+            if candidate:
+                return {**candidate, "source": "search_company", "confidence": "high"}
+            time.sleep(0.3)
 
     if not person_name_search:
         return None
@@ -489,7 +669,6 @@ def discover_channel_for_company(
             person_name=person_name,
             company_name=company_name,
             company_website=company_website,
-            api_key=api_key,
             require_cross_validation=True,
         )
         if candidate:
@@ -505,7 +684,6 @@ def discover_channel_for_company(
             person_name=person_name,
             company_name=company_name,
             company_website=company_website,
-            api_key=api_key,
             require_cross_validation=False,
         )
         if candidate:
@@ -621,25 +799,18 @@ def _run_stage_1(videos: list, channel_info: dict) -> dict | None:
             "upload_count": channel_info.get("upload_count", 0),
         }
 
-    # Condition C — Inconsistent Poster (60+ day gap between recent uploads)
-    if len(videos) >= 2:
-        gap = (videos[0]["published_at"] - videos[1]["published_at"]).days
+    # Condition C — Inconsistent Poster: any 60+ day gap among the most recent
+    # uploads signals the channel doesn't maintain a reliable cadence.
+    # Check all consecutive pairs across the full fetched window.
+    for idx in range(len(videos) - 1):
+        gap = (videos[idx]["published_at"] - videos[idx + 1]["published_at"]).days
         if gap > 60:
             return {
                 "condition": "C",
-                "reasoning": f"Gap of {gap} days between most recent two uploads",
-                "stage": 1,
-                **channel_info,
-                "last_upload_date": most_recent.date().isoformat(),
-                "upload_count": channel_info.get("upload_count", 0),
-            }
-
-    if len(videos) >= 3:
-        gap2 = (videos[1]["published_at"] - videos[2]["published_at"]).days
-        if gap2 > 60:
-            return {
-                "condition": "C",
-                "reasoning": f"Gap of {gap2} days between uploads 2 and 3",
+                "reasoning": (
+                    f"Gap of {gap} days between uploads "
+                    f"{idx + 1} and {idx + 2}"
+                ),
                 "stage": 1,
                 **channel_info,
                 "last_upload_date": most_recent.date().isoformat(),
@@ -785,7 +956,7 @@ def qualify_all_companies(
         else:
             channel_id = discovery["channel_id"]
             try:
-                videos, channel_info = get_channel_videos(channel_id)
+                videos, channel_info = get_channel_videos(channel_id, max_results=20)
             except HttpError as e:
                 if e.resp.status == 403:
                     raise
@@ -1018,10 +1189,20 @@ def qualify_youtube(
 
 if __name__ == "__main__":
     if "--test-name-match" in sys.argv:
+        # Positive: person name match
         assert _name_match("Mike McCalley Revenue Strategy", "Mike McCalley", "The Vertical Solution")
+        # Positive: company token match
         assert _name_match("StraDGy 360 Business Channel", "Zoe Fairfax", "StraDGy 360")
+        # Negative: generic channel, no name overlap
         assert not _name_match("The Best Marketing Tips Channel", "John Smith", "Solutions Inc")
-        assert _name_match("Anything at all", "Bo Li", "IQ Co")
+        # Negative: short names with no extractable tokens → reject (not wildcard accept)
+        assert not _name_match("Anything at all", "Bo Li", "IQ Co")
+        # Positive: middle name optional — first + last sufficient
+        assert _name_match("Michael Smith Branding", "Michael John Smith", "Acme Consulting")
+        # Negative: "jus" must not match "just" (the original false-positive bug)
+        assert not _name_match("Just Sport Event", "Jessica Wagner", "Jus B Media")
+        # Negative: "iq" must not match "unique" via substring
+        assert not _name_match("unique techniques channel", "Jane Doe", "IQ")
         print("All _name_match tests passed.")
         sys.exit(0)
 

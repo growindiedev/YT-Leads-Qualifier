@@ -28,7 +28,9 @@ from lead_utils import (
 from batch_qualify import rank_active_companies
 from youtube_qualifier import (
     _extract_youtube_channel_links, _websites_match, resolve_company_youtube_results,
+    _name_match, _core_company_name,
 )
+from batch_qualify import _build_lead_row, LEADS_HEADERS
 
 # ---------------------------------------------------------------------------
 # API test cases  (hit YouTube API, require YOUTUBE_API_KEY)
@@ -270,6 +272,15 @@ def run_7b_tests() -> tuple:
             print(f"        expected: {expected!r}")
             print(f"        got:      {got!r}")
 
+    # _name_match
+    check("person match (first+last)",        _name_match("Mike McCalley Revenue Strategy", "Mike McCalley", "The Vertical Solution"), True)
+    check("company token match",              _name_match("StraDGy 360 Business Channel", "Zoe Fairfax", "StraDGy 360"),             True)
+    check("middle name optional",             _name_match("Michael Smith Branding", "Michael John Smith", "Acme Consulting"),        True)
+    check("jus vs just (old false positive)", _name_match("Just Sport Event", "Jessica Wagner", "Jus B Media"),                     False)
+    check("short tokens → no wildcard",      _name_match("Anything at all", "Bo Li", "IQ Co"),                                     False)
+    check("generic channel no overlap",      _name_match("The Best Marketing Tips", "John Smith", "Solutions Inc"),                 False)
+    check("iq not substring of unique",      _name_match("unique techniques channel", "Jane Doe", "IQ"),                           False)
+
     # _websites_match
     check("acme.com/about vs acme.com",     _websites_match("https://www.acme.com/about", "http://acme.com"),   True)
     check("acme.com vs betacorp.com",        _websites_match("https://acme.com", "https://betacorp.com"),        False)
@@ -325,12 +336,102 @@ def run_7b_tests() -> tuple:
     check("all pass → condition=B (primary)",          resolved["condition"],       "B")
     check("all pass → rule=all_pass_use_primary",      resolved["resolution_rule"], "all_pass_use_primary")
 
+    # resolve_company_youtube_results — secondary FAIL via search (non-website)
+    r_secondary_search = [
+        {"condition": "A",    "company_name": "Acme", "company_rank": 0,
+         "channel_url": None,  "reasoning": "No channel", "discovery_source": "none"},
+        {"condition": "FAIL", "company_name": "Beta", "company_rank": 1,
+         "channel_url": "...", "reasoning": "Active",     "discovery_source": "search"},
+    ]
+    resolved = resolve_company_youtube_results(r_secondary_search)
+    check("secondary FAIL search → condition=REVIEW_FAIL",        resolved["condition"],       "REVIEW_FAIL")
+    check("secondary FAIL search → rule=fail_secondary_search",   resolved["resolution_rule"], "fail_secondary_search")
+
+    # resolve_company_youtube_results — primary STAGE2_NEEDED
+    r_stage2 = [
+        {"condition": "STAGE2_NEEDED", "company_name": "Acme", "company_rank": 0,
+         "channel_url": "...", "reasoning": "Needs judgment", "discovery_source": "search"},
+    ]
+    resolved = resolve_company_youtube_results(r_stage2)
+    check("primary stage2 → condition=STAGE2_NEEDED",   resolved["condition"],       "STAGE2_NEEDED")
+    check("primary stage2 → rule=stage2_needed",        resolved["resolution_rule"], "stage2_needed")
+
+    # resolve_company_youtube_results — primary ERROR, secondary passes
+    r_primary_error = [
+        {"condition": "ERROR", "company_name": "Acme", "company_rank": 0,
+         "channel_url": None,  "reasoning": "API fail", "discovery_source": "none"},
+        {"condition": "B",     "company_name": "Beta", "company_rank": 1,
+         "channel_url": "...", "reasoning": "Dead",     "discovery_source": "search"},
+    ]
+    resolved = resolve_company_youtube_results(r_primary_error)
+    check("primary error → rule=primary_error_use_secondary",  resolved["resolution_rule"], "primary_error_use_secondary")
+    check("primary error → uses secondary condition",          resolved["condition"],       "B")
+
+    # resolve_company_youtube_results — empty list
+    resolved = resolve_company_youtube_results([])
+    check("empty list → condition=A",          resolved["condition"],       "A")
+    check("empty list → rule=no_companies",    resolved["resolution_rule"], "no_companies")
+
+    # _core_company_name
+    core_cases = [
+        ("Foloware Website design & Online lead generation", "Foloware"),
+        ("JW Design",                                        "JW Design"),    # fallback: no word >3 chars that isn't a stop word
+        ("The Sales Academy",                                "Academy"),      # The/Sales are stop/short
+        ("ABC LLC",                                          "ABC LLC"),      # all tokens ≤3 chars → fallback
+        ("Acme Solutions",                                   "Acme"),         # first meaningful word
+        ("Solutions Inc",                                    "Solutions Inc"), # both stop words → fallback
+        ("Corridor Strategy Group",                          "Corridor"),     # Strategy+Group are stop words
+    ]
+    for name, expected in core_cases:
+        check(f"_core_company_name({name!r})", _core_company_name(name), expected)
+
+    # _name_match — company all stop words falls back to person-only match
+    check("all-stop company falls back to person",
+          _name_match("Mike Johnson Show", "Mike Johnson", "Solutions Group"), True)
+    check("all-stop company, person mismatch → False",
+          _name_match("random title here", "Mike Johnson", "Solutions Group"), False)
+
     if failed == 0:
         print(f"  All {passed} 7B tests passed.")
     return passed, failed
 
 
-def print_summary(api_passed, api_failed, unit_passed, unit_failed, s7a_passed, s7a_failed, s7b_passed, s7b_failed, quota_used, run_api):
+def run_7c_tests() -> tuple:
+    passed = failed = 0
+    print("\n=== 7C Tests: Lead Row Builder ===")
+
+    def check(label, got, expected):
+        nonlocal passed, failed
+        if got == expected:
+            passed += 1
+        else:
+            failed += 1
+            print(f"  FAIL  {label}")
+            print(f"        expected: {expected!r}")
+            print(f"        got:      {got!r}")
+
+    # _build_lead_row includes Session ID and Date Added at the right positions
+    sid_idx  = LEADS_HEADERS.index("Session ID")
+    date_idx = LEADS_HEADERS.index("Date Added")
+
+    r = {
+        "yt_condition": "A",
+        "session_id":   "2026-03-30-001",
+        "date_added":   "2026-03-30",
+    }
+    row = _build_lead_row(r)
+    check("row length matches headers",         len(row),          len(LEADS_HEADERS))
+    check("Session ID at correct column",       row[sid_idx],      "2026-03-30-001")
+    check("Date Added at correct column",       row[date_idx],     "2026-03-30")
+    check("missing session_id → empty string",  _build_lead_row({})[ sid_idx], "")
+    check("missing date_added → empty string",  _build_lead_row({})[date_idx], "")
+
+    if failed == 0:
+        print(f"  All {passed} 7C tests passed.")
+    return passed, failed
+
+
+def print_summary(api_passed, api_failed, unit_passed, unit_failed, s7a_passed, s7a_failed, s7b_passed, s7b_failed, s7c_passed, s7c_failed, quota_used, run_api):
     print(f"\n{'═'*60}")
     print("TEST SUMMARY")
     print(f"{'─'*36}")
@@ -339,6 +440,7 @@ def print_summary(api_passed, api_failed, unit_passed, unit_failed, s7a_passed, 
     print(f"Unit tests:  {unit_passed} passed, {unit_failed} failed")
     print(f"7A tests:    {s7a_passed} passed, {s7a_failed} failed")
     print(f"7B tests:    {s7b_passed} passed, {s7b_failed} failed")
+    print(f"7C tests:    {s7c_passed} passed, {s7c_failed} failed")
     if run_api:
         print(f"\nEstimated quota used: ~{quota_used} units")
     print(f"{'═'*60}")
@@ -354,12 +456,13 @@ if __name__ == "__main__":
     unit_passed, unit_failed = run_unit_tests()
     s7a_passed, s7a_failed   = run_7a_tests()
     s7b_passed, s7b_failed   = run_7b_tests()
+    s7c_passed, s7c_failed   = run_7c_tests()
 
     api_passed = api_failed = quota_used = 0
     if not unit_only:
         api_passed, api_failed, quota_used = run_api_tests()
 
-    print_summary(api_passed, api_failed, unit_passed, unit_failed, s7a_passed, s7a_failed, s7b_passed, s7b_failed, quota_used, not unit_only)
+    print_summary(api_passed, api_failed, unit_passed, unit_failed, s7a_passed, s7a_failed, s7b_passed, s7b_failed, s7c_passed, s7c_failed, quota_used, not unit_only)
 
-    total_failed = unit_failed + s7a_failed + s7b_failed + api_failed
+    total_failed = unit_failed + s7a_failed + s7b_failed + s7c_failed + api_failed
     sys.exit(0 if total_failed == 0 else 1)

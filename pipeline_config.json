@@ -143,6 +143,13 @@
     "person_name_search": false
   },
 
+  "ddg_search": {
+    "_comment": "DuckDuckGo integration (free, no API key). channel_discovery: search for YouTube channel URL before spending 100 YouTube API units on search.list. offer_fallback: re-classify UNCLEAR/FETCH_FAILED sites using a DDG search snippet. clutch_enrichment: search Clutch.co for revenue range and min project size to improve affordability scoring.",
+    "channel_discovery": true,
+    "offer_fallback": true,
+    "clutch_enrichment": true
+  },
+
   "icp": {
     "_comment": "ICP definition used in multi-company scoring. target_niche overrides the TARGET_NICHE env var when set. scoring_weights override the hardcoded multipliers.",
     "target_niche": "",

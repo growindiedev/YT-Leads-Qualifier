@@ -78,6 +78,7 @@ LEADS_HEADERS = [
     "Primary Score", "Score Detail",
     "YouTube Resolution", "Secondary Channels",
     "Revenue Confidence", "Revenue Score",
+    "Session ID", "Date Added",
 ]
 
 DISCARD_HEADERS = [
@@ -532,6 +533,86 @@ def _fetch_page_text_playwright(url: str, char_limit: int = 3500, timeout: int =
         return None
 
 
+def _reclassify_unclear_via_ddg(company_name: str, website: str) -> "tuple[str, str]":
+    """
+    Last-resort classifier for UNCLEAR/FETCH_FAILED sites.
+    Searches DuckDuckGo and runs the keyword scorer on the search snippets.
+    Returns (classification, reason). Falls back to UNCLEAR on any failure.
+    """
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        return ("UNCLEAR", "duckduckgo-search not installed")
+
+    query = company_name or website
+    if not query:
+        return ("UNCLEAR", "no query available")
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=3))
+    except Exception:
+        return ("UNCLEAR", "DDG search failed")
+
+    if not results:
+        return ("UNCLEAR", "no DDG results")
+
+    combined = " ".join(
+        r.get("title", "") + " " + r.get("body", "")
+        for r in results
+    ).lower()
+    classification, reason = _classify_text(combined)
+    return (classification, f"DDG snippet: {reason}")
+
+
+def _enrich_via_clutch_ddg(company_name: str) -> dict:
+    """
+    Search Clutch.co for the company to extract revenue range and minimum project size.
+    Both signals feed into estimate_revenue_confidence() for affordability scoring.
+    Returns dict with optional keys: revenue_range, min_project_size, clutch_url.
+    Returns {} on failure or if Clutch has no listing.
+    """
+    if not company_name:
+        return {}
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        return {}
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(f'site:clutch.co "{company_name}"', max_results=3))
+    except Exception:
+        return {}
+
+    for r in results:
+        url = r.get("href", "")
+        if "clutch.co" not in url:
+            continue
+        snippet = (r.get("title", "") + " " + r.get("body", "")).lower()
+        enrichment: dict = {"clutch_url": url}
+
+        rev_match = re.search(
+            r"\$[\d.]+[mkb]?\s*[-–]\s*\$[\d.]+[mkb]?", snippet, re.IGNORECASE
+        )
+        if rev_match:
+            enrichment["revenue_range"] = rev_match.group(0)
+
+        proj_match = re.search(r"\$[\d,]+\+?", snippet)
+        if proj_match:
+            val = proj_match.group(0).replace(",", "").replace("$", "").replace("+", "")
+            try:
+                if int(val) >= 5000:
+                    enrichment["min_project_size"] = proj_match.group(0)
+            except ValueError:
+                pass
+
+        if enrichment.get("revenue_range") or enrichment.get("min_project_size"):
+            return enrichment
+
+    return {}
+
+
 CASE_STUDY_SIGNALS = [
     "case study", "case studies", "client story", "client stories",
     "success story", "success stories", "our work", "portfolio",
@@ -627,6 +708,7 @@ def _detect_social_proof(text: str) -> dict:
 def classify_website_offer(
     url: "str | None",
     config: "dict | None" = None,
+    company_name: str = "",
 ) -> "tuple[str, str, str]":
     """
     Returns (classification, reason, combined_text) where combined_text
@@ -658,7 +740,9 @@ def classify_website_offer(
         result = _fetch_page_text_playwright(url, char_limit=page_char_limit)
 
     if result is None:
-        return ("FETCH_FAILED", "Could not fetch page", "")
+        # DDG fallback: keyword-score a search snippet instead of the live page
+        ddg_class, ddg_reason = _reclassify_unclear_via_ddg(company_name, url)
+        return (ddg_class, ddg_reason, "")
 
     text, base = result
     classification, reason = classify(text)
@@ -673,6 +757,10 @@ def classify_website_offer(
             fb_class, fb_reason = classify(fb_text)
             if fb_class != "UNCLEAR":
                 return (fb_class, fb_reason + f" (from {path})", text + " " + fb_text)
+        # Still UNCLEAR after all fallback pages — try DDG snippet
+        ddg_class, ddg_reason = _reclassify_unclear_via_ddg(company_name, url)
+        if ddg_class != "UNCLEAR":
+            return (ddg_class, ddg_reason, text)
 
     # Try to find a social proof page and append its text
     social_text = ""
@@ -716,8 +804,13 @@ def estimate_revenue_confidence(
     Returns (confidence_label, total_score, score_breakdown).
     Labels: "High" (>=12), "Medium" (>=8), "Low" (>=4), "Unknown" (<4)
     """
-    # Revenue range
-    rev_pts = score_revenue_range(profile.get("company_revenue", ""))
+    # Revenue range — LinkedIn data, supplemented by Clutch if available
+    linkedin_rev = profile.get("company_revenue", "")
+    clutch_rev   = profile.get("_clutch_revenue_range", "")
+    rev_pts = max(
+        score_revenue_range(linkedin_rev),
+        score_revenue_range(clutch_rev),
+    )
 
     # Company size
     size = parse_company_size(profile.get("company_size", ""))
@@ -755,7 +848,7 @@ def estimate_revenue_confidence(
     roi_pts   = 2 if sp.get("has_roi_language") else 0
     dollar_pts = 2 if sp.get("has_dollar_amounts") else 0
 
-    # Offer strength
+    # Offer strength — base signal from classifier
     offer_class  = profile.get("offer_classification", "")
     offer_reason = profile.get("_offer_reason", "")
     if offer_class == "HIGH_TICKET_B2B" and "strong" in offer_reason.lower():
@@ -764,6 +857,13 @@ def estimate_revenue_confidence(
         offer_pts = 1
     else:
         offer_pts = 0
+
+    # Clutch min project size — $10k+ confirms high-ticket positioning
+    clutch_project = profile.get("_clutch_min_project", "")
+    if clutch_project:
+        val_str = re.sub(r"[^\d]", "", clutch_project)
+        if val_str and int(val_str) >= 10000:
+            offer_pts = min(offer_pts + 2, 4)
 
     total = (rev_pts + size_pts + title_pts + tenure_pts
              + case_pts + test_pts + roi_pts + dollar_pts + offer_pts)
@@ -960,6 +1060,9 @@ def process_leads(
     if config is None:
         config = load_pipeline_config()
 
+    session_id = generate_session_id()
+    date_added = datetime.utcnow().strftime("%Y-%m-%d")
+
     # Resolve target_niche: explicit arg > config icp > env var
     icp_cfg = config.get("icp", {})
     resolved_niche = target_niche or icp_cfg.get("target_niche", "") or os.getenv("TARGET_NICHE", "")
@@ -997,6 +1100,8 @@ def process_leads(
             weights=scoring_weights,
         )
         if ranked:
+            # Store ranked order back so YouTube discovery treats rank 0 as primary
+            profile["active_companies"] = ranked
             primary = ranked[0]
             profile["company"]              = primary["company"]
             profile["job_title"]            = primary["job_title"]
@@ -1077,7 +1182,9 @@ def process_leads(
             continue
 
         # --- Offer classifier (discard list driven by config) ---
-        offer_class, offer_reason, offer_text = classify_website_offer(profile.get("website"), config)
+        offer_class, offer_reason, offer_text = classify_website_offer(
+            profile.get("website"), config, company_name=company
+        )
         profile["offer_classification"] = offer_class
         profile["_offer_reason"] = offer_reason
         profile["_social_proof"] = _detect_social_proof(offer_text) if offer_text else None
@@ -1099,6 +1206,11 @@ def process_leads(
         elif offer_class in offer_flag_on:
             profile["_offer_flag"] = offer_class
 
+        # --- Clutch enrichment for revenue / affordability scoring ---
+        clutch = _enrich_via_clutch_ddg(company)
+        profile["_clutch_revenue_range"] = clutch.get("revenue_range", "")
+        profile["_clutch_min_project"]   = clutch.get("min_project_size", "")
+
         # --- Skip YouTube if no email (saves quota) ---
         if skip_youtube_if_no_email:
             email = profile.get("email", "")
@@ -1118,8 +1230,14 @@ def process_leads(
 
         print(f"[{i}/{total}] {person} / {company}", file=sys.stderr)
 
-        # Cap companies per lead to save quota
-        active_for_yt = profile.get("active_companies", [])
+        # Cap companies per lead to save quota.
+        # Exclude negative-scored companies (e.g. large-employer roles like
+        # "Senior Brand Manager at Corp Inc") — they're not the person's own
+        # business and their corporate channels would produce false REVIEW_FAILs.
+        active_for_yt = [
+            c for c in profile.get("active_companies", [])
+            if c.get("score", 0) >= 0
+        ]
         if max_companies_per_lead:
             active_for_yt = active_for_yt[:max_companies_per_lead]
 
@@ -1199,11 +1317,15 @@ def process_leads(
     if offer_discard_count:
         print(f"Discarded {offer_discard_count} lead(s) — website offer not high-ticket B2B.", file=sys.stderr)
 
+    for r in results:
+        r.setdefault("session_id", session_id)
+        r.setdefault("date_added", date_added)
+
     elapsed = round(time.time() - start_time, 1)
 
     summary = {
-        "session_id":          generate_session_id(),
-        "date":                datetime.utcnow().strftime("%Y-%m-%d"),
+        "session_id":          session_id,
+        "date":                date_added,
         "input_file":          input_file_name,
         "total_loaded":        total,
         "skipped_dedup":       skipped,
@@ -1306,6 +1428,8 @@ def _build_lead_row(r: dict) -> list:
         r.get("yt_secondary_channels", ""),
         r.get("revenue_confidence", ""),
         r.get("revenue_score", ""),
+        r.get("session_id", ""),
+        r.get("date_added", ""),
     ]
 
 
@@ -1336,7 +1460,7 @@ def _build_error_row(r: dict) -> list:
 def write_to_sheet(results: list, sheet_id: str, tab_name: str = None) -> str:
     """
     Splits results into three tabs and writes each:
-      - Leads tab (timestamped, always new) — qualified leads only
+      - Leads tab (persistent, appended) — qualified leads only; Session ID + Date Added columns for filtering
       - Discards tab (persistent, appended) — DISCARD_* rows
       - Errors tab (persistent, appended) — ERROR rows
     Returns the spreadsheet URL.
@@ -1355,15 +1479,19 @@ def write_to_sheet(results: list, sheet_id: str, tab_name: str = None) -> str:
     discards  = [r for r in results if _is_discard(r.get("yt_condition", ""))]
     errors    = [r for r in results if r.get("yt_condition") in _ERROR_CONDITIONS]
 
-    leads_tab    = tab_name or f"Leads {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
+    leads_tab    = tab_name or "Leads"
     discards_tab = "Discards"
     errors_tab   = "Errors"
 
     if qualified:
-        _create_tab(session, sheet_id, leads_tab)
-        _write_tab(session, sheet_id, leads_tab, LEADS_HEADERS,
-                   [_build_lead_row(r) for r in qualified])
-        print(f"  Leads tab '{leads_tab}': {len(qualified)} rows written.", file=sys.stderr)
+        lead_rows = [_build_lead_row(r) for r in qualified]
+        if _tab_exists(session, sheet_id, leads_tab):
+            _append_tab(session, sheet_id, leads_tab, lead_rows)
+            print(f"  Leads tab: {len(qualified)} rows appended.", file=sys.stderr)
+        else:
+            _create_tab(session, sheet_id, leads_tab)
+            _write_tab(session, sheet_id, leads_tab, LEADS_HEADERS, lead_rows)
+            print(f"  Leads tab: {len(qualified)} rows written (new tab).", file=sys.stderr)
 
     if discards:
         discard_rows = [_build_discard_row(r) for r in discards]
