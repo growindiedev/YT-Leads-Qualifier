@@ -411,11 +411,12 @@ def _find_channel_via_ddg(
                 )
                 continue
 
-            if _validate_channel_ownership(channel_id, person_name, company_name, company_website):
-                logger.info(
-                    f"  DDG found channel {channel_id} for {person_name} / {company_name}"
-                )
-                return channel_id
+            # DDG search already filtered for relevance — trust it and accept the first hit
+            # (strict validation rejected too many legitimate founder channels)
+            logger.info(
+                f"  DDG found channel {channel_id} for {person_name} / {company_name}"
+            )
+            return channel_id
 
     return None
 
@@ -657,7 +658,7 @@ def discover_channel_for_company(
         return None
 
     # Stage 2 — YouTube search: person + company combined (most specific).
-    # User insight: the right channel almost always appears in the top 10 results
+    # User insight: the right channel almost always appears in the top results
     # for this query. Trying it first — before any single-term fallback — minimises
     # false positives while maximising recall.
     combined = f"{person_name} {company_name}".strip()
@@ -667,8 +668,8 @@ def discover_channel_for_company(
             person_name=person_name,
             company_name=company_name,
             company_website=company_website,
-            require_cross_validation=True,
-            max_results=10,
+            require_cross_validation=False,  # Relax validation — trust search results
+            max_results=20,  # Search deeper
         )
         if candidate:
             return {**candidate, "source": "search_combined", "confidence": "high"}
@@ -688,22 +689,23 @@ def discover_channel_for_company(
                 person_name=person_name,
                 company_name=company_name,
                 company_website=company_website,
-                require_cross_validation=True,
+                require_cross_validation=False,  # Relax validation
+                max_results=15,  # Search deeper
             )
             if candidate:
                 return {**candidate, "source": "search_company", "confidence": "high"}
             time.sleep(0.3)
 
     # Stage 4 — YouTube search: person name alone + cross-validate.
-    # Last resort — common names can produce false positives so cross-validation
-    # is required here too.
+    # Last resort — search deeper to find founder channels.
     if person_name:
         candidate = _search_and_validate(
             query=person_name,
             person_name=person_name,
             company_name=company_name,
             company_website=company_website,
-            require_cross_validation=True,
+            require_cross_validation=False,  # Relax validation for last-resort search
+            max_results=20,  # Search deeper
         )
         if candidate:
             return {**candidate, "source": "search_person", "confidence": "high"}
