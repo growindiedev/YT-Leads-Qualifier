@@ -9,7 +9,22 @@
       "Bash(.venv/bin/python youtube_qualifier.py --test-name-match)",
       "Bash(.venv/bin/python -c \"import batch_qualify; print\\(''''OK''''\\)\")",
       "Bash(.venv/bin/python test_cases.py)",
-      "Bash(*)"
+      "Bash(*)",
+      "WebFetch(domain:pistildata.com)",
+      "WebFetch(domain:www.intromarketresearch.group)",
+      "WebFetch(domain:www.johannarosecreative.com)",
+      "WebFetch(domain:spit-ball.com)",
+      "WebSearch",
+      "WebFetch(domain:inspiredsocialstudio.com)",
+      "WebFetch(domain:www.jsrassociates.com)",
+      "WebFetch(domain:www.vetbooks.com)",
+      "WebFetch(domain:whyzelabs.com)",
+      "WebFetch(domain:truenorthsw.com)",
+      "WebFetch(domain:www.solarponics.com)",
+      "WebFetch(domain:www.gripd.com)",
+      "WebFetch(domain:www.sagacitygolf.com)",
+      "WebFetch(domain:mentorshipsuccess.com)",
+      "WebFetch(domain:zpods.com)"
     ]
   }
 }

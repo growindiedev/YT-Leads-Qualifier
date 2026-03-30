@@ -3,13 +3,14 @@
 
   "batch": {
     "_comment": "Batch processing defaults. default_limit applies when no --limit flag is given. Set to null to process all leads by default.",
-    "default_limit": 15
+    "default_limit": 7
   },
 
   "website_classifier": {
-    "_comment": "Controls for the website offer classifier. fetch_timeout: seconds before a request is abandoned. page_char_limit: how many characters of page text to analyse.",
+    "_comment": "Controls for the website offer classifier. fetch_timeout: seconds before a request is abandoned. page_char_limit: how many characters of page text to analyse. min_body_chars: if requests returns fewer chars than this, Playwright is used to re-fetch the JS-rendered page.",
     "fetch_timeout": 6,
-    "page_char_limit": 3500
+    "page_char_limit": 3500,
+    "min_body_chars": 300
   },
 
   "input": {

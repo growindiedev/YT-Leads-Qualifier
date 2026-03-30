@@ -429,6 +429,43 @@ def _classify_text(text: str) -> "tuple[str, str]":
     return ("UNCLEAR", f"B2B:{b2b_score} B2C:{b2c_score} Low:{low_score}")
 
 
+def _classify_with_claude(text: str) -> "tuple[str, str]":
+    """
+    Use Claude Haiku to classify a website's offer type.
+    Returns (classification, reason). Falls back to UNCLEAR on API error.
+    """
+    prompt = (
+        "Classify this company website's primary offer as exactly one of:\n"
+        "HIGH_TICKET_B2B — premium services sold to businesses: consulting, coaching, agency retainers, "
+        "fractional executives, done-for-you services, advisory, speaking, strategy engagements, B2B SaaS\n"
+        "LOW_TICKET — low-priced digital products: online courses, ebooks, templates, memberships\n"
+        "B2C — sold primarily to individual consumers: personal health/fitness, dating, consumer products\n"
+        "UNCLEAR — cannot determine from available text\n\n"
+        f"Website text:\n---\n{text[:3000]}\n---\n\n"
+        "Reply with exactly two lines:\n"
+        "CLASSIFICATION: <one of the four options above>\n"
+        "REASON: <one sentence>"
+    )
+    try:
+        resp = _get_anthropic_client().messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=80,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        classification = "UNCLEAR"
+        reason = "Claude response unparseable"
+        for line in resp.content[0].text.strip().splitlines():
+            if line.startswith("CLASSIFICATION:"):
+                val = line.split(":", 1)[1].strip()
+                if val in ("HIGH_TICKET_B2B", "LOW_TICKET", "B2C", "UNCLEAR"):
+                    classification = val
+            elif line.startswith("REASON:"):
+                reason = line.split(":", 1)[1].strip()
+        return (classification, reason)
+    except Exception as e:
+        return ("UNCLEAR", f"Claude error: {str(e)[:60]}")
+
+
 _WEBSITE_CLASSIFIER_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ContentScaleBot/1.0)"}
 _FALLBACK_PATHS = ["/services", "/work-with-me", "/how-it-works",
                    "/offerings", "/coaching", "/consulting", "/about"]
@@ -459,6 +496,35 @@ def _fetch_page_text(url: str, char_limit: int = 3500, timeout: int = 6) -> "tup
             tag.decompose()
         body_text = soup.get_text(separator=" ", strip=True)[:char_limit].lower()
 
+        parsed = urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        return (prefix + body_text, base)
+    except Exception:
+        return None
+
+
+def _fetch_page_text_playwright(url: str, char_limit: int = 3500, timeout: int = 15) -> "tuple[str, str] | None":
+    """
+    Fetch a JS-rendered page using Playwright headless Chromium.
+    Returns (lowercased_text, base_scheme_host) or None on failure.
+    Only called when the fast requests path returns thin content.
+    """
+    from urllib.parse import urlparse
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            title = page.title() or ""
+            meta_el = page.query_selector('meta[name="description"]')
+            meta_desc = meta_el.get_attribute("content") if meta_el else ""
+            prefix = (title + " " + (meta_desc or "") + " ").lower()
+            body_text = (page.inner_text("body") or "")[:char_limit].lower()
+            browser.close()
         parsed = urlparse(url)
         base = f"{parsed.scheme}://{parsed.netloc}"
         return (prefix + body_text, base)
@@ -570,6 +636,9 @@ def classify_website_offer(
     wc_cfg = (config or {}).get("website_classifier", {})
     fetch_timeout = wc_cfg.get("fetch_timeout", 6)
     page_char_limit = wc_cfg.get("page_char_limit", 3500)
+    min_body_chars = wc_cfg.get("min_body_chars", 300)
+
+    classify = _classify_text
 
     if not url:
         return ("NO_WEBSITE", "No website URL available", "")
@@ -580,24 +649,28 @@ def classify_website_offer(
     try:
         result = _fetch_page_text(url, char_limit=page_char_limit, timeout=fetch_timeout)
     except requests.Timeout:
-        return ("FETCH_FAILED", "Request timed out", "")
-    except Exception as e:
-        return ("FETCH_FAILED", str(e)[:80], "")
+        result = None
+    except Exception:
+        result = None
+
+    # Fall back to Playwright if requests returned nothing or thin content (JS-rendered site)
+    if result is None or len(result[0]) < min_body_chars:
+        result = _fetch_page_text_playwright(url, char_limit=page_char_limit)
 
     if result is None:
         return ("FETCH_FAILED", "Could not fetch page", "")
 
     text, base = result
-    classification, reason = _classify_text(text)
+    classification, reason = classify(text)
 
     if classification == "UNCLEAR":
-        # Try each fallback page in order; stop at first non-UNCLEAR result
+        # Try fallback pages; stop at first non-UNCLEAR result
         for path in _FALLBACK_PATHS:
             fallback = _fetch_page_text(base + path, char_limit=2000, timeout=fetch_timeout)
             if fallback is None:
                 continue
             fb_text, _ = fallback
-            fb_class, fb_reason = _classify_text(fb_text)
+            fb_class, fb_reason = classify(fb_text)
             if fb_class != "UNCLEAR":
                 return (fb_class, fb_reason + f" (from {path})", text + " " + fb_text)
 

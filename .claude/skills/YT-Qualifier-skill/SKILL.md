@@ -33,33 +33,7 @@ If no input can be resolved, stop and tell the user.
 
 ---
 
-## Step 1 — Website pre-check (before any YouTube API calls)
-
-For each lead, navigate to their company website and evaluate the offer before spending any YouTube API quota.
-
-**HIGH-TICKET B2B PASS signals — look for:**
-- Words like: retainer, book a call, apply now, done-for-you, advisory, consulting engagement, strategy session, custom proposal
-- Services clearly priced above $1,000 if pricing is listed
-- Target audience is clearly businesses or professionals, not consumers
-- A real service offering exists, not just a blog or lead magnet with no offer
-
-**DISCARD signals:**
-- Price points under $500 visible on the page
-- Primarily sells to consumers: weight loss, personal dating, general fitness, etc.
-- Site is broken, parked, or has no content
-- Only sells low-ticket digital products with no high-ticket service
-
-**Outcomes:**
-- Clear high-ticket B2B offer → **KEEP**, proceed to YouTube phase
-- Low-ticket or B2C signals → **DISCARD** (set `yt_condition = "DISCARD"`, `why_chosen = "Offer does not match ICP — low-ticket or B2C"`)
-- No website found → **DISCARD** (set `yt_condition = "DISCARD"`, `why_chosen = "No website found"`)
-- Offer unclear → **FLAG** as `"Offer Unclear"` in confidence, proceed but note it
-
-Remove all DISCARDed leads from the batch before running Step 2. Do not consume YouTube quota on them.
-
----
-
-## Step 2 — Run batch processing
+## Step 1 — Run batch processing
 
 ```
 .venv/bin/python batch_qualify.py \
@@ -82,7 +56,7 @@ Read `/tmp/yt_batch_results.json` as the results array.
 
 ---
 
-## Step 3 — Report errors immediately
+## Step 2 — Report errors immediately
 
 Scan results for `yt_condition == "ERROR"`. Print each one:
 
@@ -96,13 +70,55 @@ will skip already-processed leads automatically.
 
 ---
 
-## Step 4 — Enrich each non-ERROR row
+## Step 3 — Enrich each non-ERROR row
 
 For every row where `yt_condition` is not `"ERROR"`, do the following in one pass.
 
 ---
 
-### 4a. Handle REVIEW_FAIL rows
+### 4a. Score ICP tier from LinkedIn data — no WebFetch
+
+**Do not use WebFetch in this step.** The pipeline's keyword classifier has already
+determined `offer_classification`. Trust it. Your job here is tier scoring only,
+using the fields already in the row: `_company_description`, `_headline`,
+`_specialities`, `_industry`, `job_title`, `_summary`.
+
+Do not create new discards based on your own judgment. If the pipeline passed a
+lead, keep it. Discard decisions belong in the pipeline, not in-session.
+
+---
+
+**Score offer depth for every non-DISCARD, non-ERROR lead:**
+
+**Tier 1 — Strong ICP fit:**
+- Specific niche stated (not generic "I help businesses grow")
+- Outcome language with numbers or timeframes in description or headline
+- Title signals founder-led advisory: Founder, CEO, Owner, Principal, Partner
+- Description mentions clients, results, transformations, or named case studies
+
+**Tier 2 — Good fit:**
+- Clear B2B service offer but generic messaging
+- Founder/CEO title present but description is agency-style, not personal brand
+- Service business confirmed but niche or outcomes not specified
+
+**Tier 3 — Weak fit:**
+- Technically B2B but vague or multi-offering
+- No founder-led signal, outcomes, or niche specificity
+- Reads like a large agency-of-record rather than an expert-led advisory
+
+**For UNCLEAR / FETCH_FAILED leads:** The pipeline could not classify the site.
+Set confidence to `"Offer Unclear | Offer Flag: FETCH_FAILED"` and keep the lead —
+do not discard, do not WebFetch. Let it through for manual review.
+
+**Write the tier into the `confidence` field:**
+- `"Tier 1 — Strong ICP"`
+- `"Tier 2 — Good Fit"`
+- `"Tier 3 — Weak Fit"`
+- `"Offer Unclear | Offer Flag: FETCH_FAILED"` (for UNCLEAR/FETCH_FAILED only)
+
+---
+
+### 4c. Handle REVIEW_FAIL rows
 
 `REVIEW_FAIL` means a secondary company (not the primary business) was found to have
 an active polished YouTube channel. The primary company passed. This requires a judgment
@@ -123,7 +139,7 @@ visible so you can make the call.
 
 ---
 
-### 4b. Stage 2 judgment (only if `yt_condition == "STAGE2_NEEDED"`)
+### 4d. Stage 2 judgment (only if `yt_condition == "STAGE2_NEEDED"`)
 
 When a lead has multiple companies and `_all_company_results` is present,
 check if any of those results also have `STAGE2_NEEDED`. If so, evaluate
@@ -144,7 +160,7 @@ Update `yt_condition` on the row accordingly.
 
 ---
 
-### 4c. Stage 2 single-company judgment (legacy — same as before)
+### 4e. Stage 2 single-company judgment (legacy — same as before)
 
 If `_all_company_results` is absent or has only one entry, use the existing
 D vs F vs FAIL criteria from `references/conditions.md` on `_yt_videos`.
@@ -171,7 +187,7 @@ If genuinely unclear → default to **Condition D**.
 
 ---
 
-### 4d. Why Chosen — all non-ERROR rows
+### 4f. Why Chosen — all non-ERROR rows
 
 For single-company leads, write 2–3 sentences:
 1. What the company sells / what their business does
@@ -191,24 +207,28 @@ as source material. Write only from what's available — do not fabricate detail
 
 ---
 
-### 4e. Confidence — all non-ERROR rows
+### 4g. Confidence — all non-ERROR rows
 
-Set `confidence` to one of:
+Confidence is now a composite field. Lead with the ICP tier from Step 4a,
+then append any contact or data flags separated by ` | `.
 
-- **Normal** — email present, company and role are clear, offer is clear,
-  no multi-company ambiguity
-- **Multi-Company** — lead has 2+ active roles; primary was selected by scoring
-  but secondary roles exist. Worth verifying before outreach which company
-  they're most focused on right now.
-- **Low Confidence** — no email, or profile is sparse / hard to reach
-- **Offer Unclear** — cannot determine what they sell from available data
-- **No Active Contacts** — no email and no phone
-- **Review Required — Secondary FAIL** — secondary company has active YouTube;
-  manual check needed before outreach
-- **Offer Flag: UNCLEAR** — website classifier returned UNCLEAR; offer may be
-  B2C or low-ticket, verify before outreach
-- **Offer Flag: FETCH_FAILED** — company website could not be fetched;
-  manually verify the offer before outreach
+**ICP tier (always first):**
+- `Tier 1 — Strong ICP` — specific niche, outcome language, social proof, founder-led
+- `Tier 2 — Good Fit` — clear B2B offer but generic messaging
+- `Tier 3 — Weak Fit` — technically B2B but vague or not founder-led
+- `Offer Unclear` — cannot determine after website check
+
+**Append these flags when they apply:**
+- `Multi-Company` — 2+ active roles, worth verifying primary focus before outreach
+- `Review Required — Secondary FAIL` — secondary company has active YouTube channel
+- `Offer Flag: FETCH_FAILED` — website could not be fetched even after Playwright retry
+
+**Examples:**
+- `Tier 1 — Strong ICP` ← clean lead
+- `Tier 1 — Strong ICP | Multi-Company` ← strong lead, verify primary company first
+- `Tier 2 — Good Fit | Multi-Company` ← decent lead, verify primary company first
+- `Tier 3 — Weak Fit` ← deprioritise
+- `Offer Unclear` ← lowest priority
 
 ---
 
@@ -233,14 +253,14 @@ Use this to audit cases where the wrong company was selected as primary.
 If title=0 and tenure=0, the scoring had little to work with — consider
 manually verifying which company is their main business before outreach.
 
-## Step 5 — Remove internal fields
+## Step 4 — Remove internal fields
 
 For each result, delete before writing:
 `_yt_videos`, `_yt_reasoning`, `_summary`, `_headline`, `_company_description`, `_specialities`, `_industry`, `_location`
 
 ---
 
-## Step 6 — Write to Google Sheets
+## Step 5 — Write to Google Sheets
 
 Save the enriched results array to `/tmp/yt_batch_results.json`, then run:
 
@@ -254,7 +274,7 @@ Save the enriched results array to `/tmp/yt_batch_results.json`, then run:
 
 ---
 
-## Step 7 — Updated Print Summary
+## Step 6 — Print Summary
 
 ```
 BATCH COMPLETE
