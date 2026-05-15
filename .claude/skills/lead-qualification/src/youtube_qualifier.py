@@ -10,12 +10,12 @@ from datetime import datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import anthropic
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+load_dotenv(find_dotenv())
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)

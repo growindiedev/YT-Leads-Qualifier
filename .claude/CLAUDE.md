@@ -31,9 +31,24 @@ Qualifies raw B2B leads (CSV or Google Sheet) through a multi-stage pipeline and
 ├── Input_lists/                  ← Input CSVs (gitignored — never commit)
 └── .claude/
     ├── CLAUDE.md                 ← This file
-    └── skills/YT-Qualifier-skill/
-        ├── SKILL.md              ← /qualify-leads skill definition
-        └── references/           ← Condition definitions, API reference
+    └── skills/lead-qualification/
+        ├── SKILL.md              ← Skill index — workflow routing table
+        ├── Workflows/
+        │   ├── Qualify.md        ← /qualify-leads workflow
+        │   └── CheckQuota.md     ← /check-quota workflow
+        ├── References/
+        │   ├── conditions.md     ← A/B/C/D/E/F/FAIL/REVIEW_FAIL definitions
+        │   ├── youtube-api.md    ← YouTube Data API v3 reference
+        │   └── pipeline.md       ← 6-gate pipeline architecture
+        └── src/
+            ├── batch_qualify.py  ← Orchestrator + Sheets I/O
+            ├── lead_utils.py     ← Parse/score primitives
+            ├── pipeline_filters.py ← 12-filter pipeline
+            ├── youtube_qualifier.py ← Channel discovery + Stage 1
+            ├── test_cases.py     ← Unit + API test suite
+            ├── pipeline_config.json ← All filter toggles and thresholds
+            ├── session_counter.json ← Runtime session counter
+            └── requirements.txt  ← Python dependencies
 ```
 
 ---

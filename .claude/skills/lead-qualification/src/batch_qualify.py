@@ -27,9 +27,9 @@ from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+load_dotenv(find_dotenv())
 
 # Allow running from any directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

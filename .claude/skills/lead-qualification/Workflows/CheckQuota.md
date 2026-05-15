@@ -1,17 +1,12 @@
----
-name: check-quota
-description: Check YouTube Data API v3 quota status. Runs a 1-unit test call and reports whether quota is available or exhausted. Also shows quota cost reference for common operations.
----
-
-# Check YouTube Quota Skill
+# Check YouTube Quota Workflow
 
 Run this script and report the result:
 
 ```
 .venv/bin/python3 - << 'EOF'
 import os, sys, json
-from dotenv import load_dotenv
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath("batch_qualify.py")), ".env"))
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(usecwd=True))
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError

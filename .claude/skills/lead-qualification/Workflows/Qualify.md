@@ -1,17 +1,12 @@
----
-name: qualify-leads
-description: Qualify a batch of leads from a CSV or Google Sheet against ContentScale's ICP. First checks each company website for a high-ticket B2B offer, then runs YouTube channel analysis. Trigger when the user provides a CSV or Sheet of leads and wants them qualified, or asks to process leads.
----
-
-# Qualify Leads Skill
+# Qualify Leads Workflow
 
 Runs the ContentScale lead qualification pipeline on a batch of leads.
 Takes a CSV or Google Sheet as input, checks each company website for a high-ticket B2B offer,
 qualifies each lead's YouTube presence, generates Why Chosen + Confidence for each,
 and writes results to a Google Sheet.
 
-Read `references/conditions.md` before making any qualification judgments.
-Read `references/youtube_api.md` if debugging API issues.
+Read `References/conditions.md` before making any qualification judgments.
+Read `References/youtube-api.md` if debugging API issues.
 
 ---
 
@@ -36,7 +31,7 @@ If no input can be resolved, stop and tell the user.
 ## Step 1 — Run batch processing
 
 ```
-.venv/bin/python batch_qualify.py \
+.venv/bin/python .claude/skills/lead-qualification/src/batch_qualify.py \
   --input "{input}" \
   --output-sheet "{output_sheet}" \
   --no-claude \
@@ -146,7 +141,7 @@ check if any of those results also have `STAGE2_NEEDED`. If so, evaluate
 each one that needs judgment before applying the resolution rule.
 
 Use the `_yt_videos` array from the relevant company result.
-Refer to `references/conditions.md` for full D vs F vs FAIL criteria.
+Refer to `References/conditions.md` for full D vs F vs FAIL criteria.
 
 After assigning each STAGE2_NEEDED result a condition (D, F, or FAIL),
 re-run the resolution rule mentally:
@@ -163,7 +158,7 @@ Update `yt_condition` on the row accordingly.
 ### 4e. Stage 2 single-company judgment (legacy — same as before)
 
 If `_all_company_results` is absent or has only one entry, use the existing
-D vs F vs FAIL criteria from `references/conditions.md` on `_yt_videos`.
+D vs F vs FAIL criteria from `References/conditions.md` on `_yt_videos`.
 
 **Condition D (good lead — weak content):**
 - Exclusively raw podcast recordings, webinar/Zoom recordings, or interview clips
@@ -232,7 +227,6 @@ then append any contact or data flags separated by ` | `.
 
 ---
 
-
 ## Score Detail Reference
 
 The `score_detail` JSON written to the "Score Detail" column in the Leads tab
@@ -265,12 +259,10 @@ For each result, delete before writing:
 Save the enriched results array to `/tmp/yt_batch_results.json`, then run:
 
 ```
-.venv/bin/python batch_qualify.py \
+.venv/bin/python .claude/skills/lead-qualification/src/batch_qualify.py \
   --write-results /tmp/yt_batch_results.json \
   --output-sheet "{output_sheet}"
 ```
-
----
 
 ---
 
@@ -304,5 +296,3 @@ Discards total:                {n} written to Discards tab
 
 Results: https://docs.google.com/spreadsheets/d/{sheet_id}
 ```
-
----
