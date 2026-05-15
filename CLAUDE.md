@@ -35,7 +35,7 @@ Qualifies raw B2B leads (CSV or Google Sheet) through a multi-stage pipeline and
 # Setup
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r .claude/skills/lead-qualification/src/requirements.txt
 
 # Tests (run before every commit — 2 seconds, no API keys needed)
 .venv/bin/python3 .claude/skills/lead-qualification/src/test_cases.py --unit-only
